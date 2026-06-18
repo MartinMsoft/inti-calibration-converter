@@ -115,7 +115,7 @@ def generate_excel(vols: dict, tank_name: str, cert_number: str) -> bytes:
 
     # Info certificado
     info = [
-        ("Razón Social:", "ODFJELL TERMINALS TAGSA S.A."),
+        ("Razón Social:", "Antivari S.A."),
         ("Tanque Nº:", tank_name),
         ("Certificado INTI Nº:", cert_number),
         ("Unidad:", "dm³"),
@@ -191,7 +191,7 @@ def main():
     )
 
     st.title("📊 Conversor Tablas de Calibración INTI")
-    st.caption("ODFJELL TERMINALS TAGSA S.A.")
+    st.caption("Antivari S.A.")
     st.divider()
 
     # API key
