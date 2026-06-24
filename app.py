@@ -275,13 +275,15 @@ def find_batches_to_retry(batch_results: list, validation: dict) -> set[int]:
                 retry_idx.add(b_idx)
                 break
 
-    # Lotes adyacentes a gaps
+    # Lotes adyacentes a gaps (interseccion con el rango faltante +-20mm)
     if missing_s:
         min_m, max_m = min(missing_s), max(missing_s)
         for b_idx, batch, rows in batch_results:
             if not rows: continue
             bases = [int(r["base_mm"]) for r in rows]
-            if max(bases) + 9 >= min_m - 20 or min(bases) <= max_m + 20:
+            batch_min = min(bases)
+            batch_max = max(bases) + 9
+            if batch_max >= min_m - 20 and batch_min <= max_m + 20:
                 retry_idx.add(b_idx)
 
     return retry_idx
@@ -547,6 +549,10 @@ def main():
         else:
             validation   = validation_1
             scale_fixes  = sf1
+
+        if not vols:
+            st.error("No se pudieron extraer datos del PDF. Revisa que el PDF tenga tablas de calibracion visibles y vuelve a intentar.")
+            st.stop()
 
         st.write("Generando Excel...")
         excel_bytes = generate_excel(vols, tank_name, cert_number or "-",
