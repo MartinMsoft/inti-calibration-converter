@@ -125,6 +125,96 @@ def has_decimals(vols: dict) -> bool:
     return any(isinstance(v, float) and v != int(v) for v in sample)
 
 
+# ── Validación automática ────────────────────────────────────────────────────
+
+def validate_vols(vols: dict) -> dict:
+    """
+    Valida la integridad del diccionario mm→dm³.
+    Retorna {"ok": bool, "errors": [...], "warnings": [...], "stats": {...}}
+    """
+    errors   = []
+    warnings = []
+
+    if not vols:
+        return {"ok": False, "errors": ["No hay datos."], "warnings": [], "stats": {}}
+
+    mm_sorted = sorted(vols.keys())
+    min_mm, max_mm = mm_sorted[0], mm_sorted[-1]
+    total_expected = max_mm - min_mm + 1
+
+    # 1. MM correlativos: ningún valor faltante
+    missing = [mm for mm in range(min_mm, max_mm + 1) if mm not in vols]
+    if missing:
+        # Agrupar rangos contiguos para no listar miles de números
+        groups = []
+        start = missing[0]
+        prev  = missing[0]
+        for m in missing[1:]:
+            if m == prev + 1:
+                prev = m
+            else:
+                groups.append((start, prev))
+                start = prev = m
+        groups.append((start, prev))
+        ranges_str = ", ".join(
+            str(a) if a == b else f"{a}-{b}" for a, b in groups[:10]
+        )
+        if len(groups) > 10:
+            ranges_str += f" ... y {len(groups) - 10} rangos más"
+        errors.append(f"MM faltantes ({len(missing)} valores): {ranges_str}")
+
+    # 2. Volumen siempre creciente (no puede disminuir)
+    non_mono = []
+    prev_vol = None
+    for mm in mm_sorted:
+        vol = vols[mm]
+        if prev_vol is not None and vol < prev_vol:
+            non_mono.append((mm, prev_vol, vol))
+        prev_vol = vol
+    if non_mono:
+        sample = non_mono[:5]
+        detail = "; ".join(f"mm={mm}: {pv:.3f}→{v:.3f}" for mm, pv, v in sample)
+        if len(non_mono) > 5:
+            detail += f" ... y {len(non_mono) - 5} más"
+        errors.append(f"Volumen decrece en {len(non_mono)} punto(s): {detail}")
+
+    # 3. Saltos bruscos de volumen entre mm consecutivos
+    increments = []
+    for i in range(1, len(mm_sorted)):
+        mm_curr = mm_sorted[i]
+        mm_prev = mm_sorted[i - 1]
+        if mm_curr == mm_prev + 1:  # solo comparar mm consecutivos
+            increments.append(vols[mm_curr] - vols[mm_prev])
+
+    if increments:
+        avg_inc = sum(increments) / len(increments)
+        # Alertar si algún incremento es >20x el promedio o negativo
+        outliers = [
+            (mm_sorted[i + 1], increments[i])
+            for i in range(len(increments))
+            if increments[i] > avg_inc * 20 or increments[i] < 0
+        ]
+        if outliers:
+            sample = outliers[:5]
+            detail = "; ".join(f"mm={mm}: Δ={d:.3f}" for mm, d in sample)
+            warnings.append(f"Incrementos anómalos en {len(outliers)} punto(s): {detail}")
+
+    stats = {
+        "total_mm": len(vols),
+        "rango": f"{min_mm} – {max_mm} mm",
+        "vol_min": f"{min(vols.values()):.3f}",
+        "vol_max": f"{max(vols.values()):.3f}",
+        "faltantes": len(missing),
+    }
+
+    return {
+        "ok": len(errors) == 0,
+        "errors": errors,
+        "warnings": warnings,
+        "stats": stats,
+    }
+
+
 # ── Generación del Excel ─────────────────────────────────────────────────────
 
 def generate_excel(vols: dict, tank_name: str, cert_number: str) -> bytes:
@@ -271,21 +361,67 @@ def main():
                 st.stop()
 
             st.write("Generando Excel…")
-            vols, warns = build_vols(all_rows)
-            for w in warns:
+            vols, build_warns = build_vols(all_rows)
+            for w in build_warns:
                 st.warning(w)
+
+            st.write("Validando integridad de los datos…")
+            validation = validate_vols(vols)
             excel_bytes = generate_excel(vols, tank_name, cert_number or "—")
 
             status.update(label="¡Listo!", state="complete")
 
-        st.success(f"Se procesaron **{len(vols)}** puntos de medición (mm 0 a {max(vols.keys())}).")
+        # ── Reporte de validación ──────────────────────────────────────────
+        st.subheader("Reporte de validación")
+
+        s = validation["stats"]
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Total mm procesados", s["total_mm"])
+        col2.metric("Rango", s["rango"])
+        col3.metric("Volumen mín", s["vol_min"] + " dm³")
+        col4.metric("Volumen máx", s["vol_max"] + " dm³")
+
+        if validation["ok"] and not validation["warnings"]:
+            st.success("✅ Validación APROBADA — todos los controles pasaron correctamente.")
+        elif validation["ok"] and validation["warnings"]:
+            st.warning("⚠️ Validación con ADVERTENCIAS — revisá los detalles antes de usar el archivo.")
+        else:
+            st.error("❌ Validación FALLIDA — el archivo tiene errores. NO usar hasta corregir.")
+
+        if validation["errors"]:
+            with st.expander("❌ Errores encontrados", expanded=True):
+                for e in validation["errors"]:
+                    st.error(e)
+
+        if validation["warnings"]:
+            with st.expander("⚠️ Advertencias", expanded=True):
+                for w in validation["warnings"]:
+                    st.warning(w)
+
+        if build_warns:
+            with st.expander("🔧 Correcciones automáticas aplicadas", expanded=False):
+                for w in build_warns:
+                    st.info(w)
+
+        st.divider()
+
         fname = f"TK-{tank_name}_Tabla_Llenado.xlsx"
-        st.download_button(
-            label="⬇️ Descargar Excel",
-            data=excel_bytes,
-            file_name=fname,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+        if validation["ok"]:
+            st.download_button(
+                label="⬇️ Descargar Excel",
+                data=excel_bytes,
+                file_name=fname,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        else:
+            st.download_button(
+                label="⬇️ Descargar Excel igualmente (con errores)",
+                data=excel_bytes,
+                file_name=fname,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="secondary",
+            )
+            st.caption("⚠️ Se recomienda NO usar este archivo hasta resolver los errores indicados.")
 
 if __name__ == "__main__":
     main()
