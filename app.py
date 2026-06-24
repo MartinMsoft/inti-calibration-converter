@@ -15,7 +15,7 @@ MODEL_PRECISE = "claude-sonnet-4-6"           # 2ª pasada: mayor precisión OCR
 # ── Helpers de imagen ────────────────────────────────────────────────────────
 
 def pdf_to_images(pdf_bytes: bytes):
-    return convert_from_bytes(pdf_bytes, dpi=200)
+    return convert_from_bytes(pdf_bytes, dpi=300)
 
 def image_to_base64(image) -> str:
     buf = io.BytesIO()
@@ -96,22 +96,99 @@ def extract_page(client: anthropic.Anthropic, image, page_num: int,
 
 # ── Construcción del diccionario mm→dm³ ─────────────────────────────────────
 
-def build_vols(all_rows: list[dict]) -> tuple[dict[int, float], list[str]]:
+def build_vols(page_results: list) -> tuple[dict[int, float], list[str]]:
+    """
+    Construye el diccionario mm→dm³ procesando página por página.
+    Detecta y corrige offsets sistemáticos de base_mm causados por números de página.
+    """
     jump_warnings = []
     vols = {}
     prev_base = None
-    for row in all_rows:
-        base = int(row["base_mm"])
-        if prev_base is not None and base != prev_base + 10:
-            jump_warnings.append(
-                f"Salto en base_mm: se esperaba {prev_base + 10} pero el PDF entregó {base} "
-                f"(diferencia: {base - (prev_base + 10)}). Verificar manualmente."
-            )
-        prev_base = base
-        for i, v in enumerate(row["values"][:10]):
-            if v is not None:
-                vols[base + i] = v
+
+    for page_num, _img, rows in page_results:
+        if not rows:
+            continue
+
+        # Detectar offset sistemático: si las primeras filas de esta página
+        # tienen todas el mismo desplazamiento vs el esperado, es error de página
+        if prev_base is not None and len(rows) >= 2:
+            expected_start = prev_base + 10
+            actual_start   = int(rows[0]["base_mm"])
+            offset         = actual_start - expected_start
+
+            if offset != 0:
+                # Verificar que el offset es consistente en todas las filas de la página
+                offsets = [int(r["base_mm"]) - (expected_start + 10 * i)
+                           for i, r in enumerate(rows)]
+                if len(set(offsets)) == 1:
+                    # Offset uniforme → corregir toda la página
+                    jump_warnings.append(
+                        f"Página {page_num}: offset sistemático de {offset} mm en base_mm "
+                        f"(número de página contaminó la lectura). Corregido automáticamente."
+                    )
+                    rows = [{"base_mm": int(r["base_mm"]) - offset,
+                             "values": r["values"]} for r in rows]
+                else:
+                    # Offset irregular → reportar sin corregir
+                    jump_warnings.append(
+                        f"Salto en base_mm página {page_num}: se esperaba {expected_start} "
+                        f"pero el PDF entregó {actual_start} (diferencia: {offset}). "
+                        f"Verificar manualmente."
+                    )
+
+        for row in rows:
+            base = int(row["base_mm"])
+            if prev_base is not None and base != prev_base + 10 and not jump_warnings:
+                jump_warnings.append(
+                    f"Salto en base_mm: se esperaba {prev_base + 10} pero se recibió {base}."
+                )
+            prev_base = base
+            for i, v in enumerate(row["values"][:10]):
+                if v is not None:
+                    vols[base + i] = v
+
     return vols, jump_warnings
+
+
+def normalize_scale(vols: dict) -> tuple[dict[int, float], list[str]]:
+    """
+    Detecta y corrige valores con escala incorrecta (×1000 o ÷1000)
+    causados por lectura errónea del separador de miles.
+    Compara cada valor contra sus vecinos inmediatos.
+    """
+    if len(vols) < 10:
+        return vols, []
+
+    mm_sorted = sorted(vols.keys())
+    corrected = dict(vols)
+    fixes = []
+    WINDOW = 5  # vecinos a consultar en cada lado
+
+    for idx, mm in enumerate(mm_sorted):
+        v = vols[mm]
+        neighbors = [
+            vols[mm_sorted[j]]
+            for j in range(max(0, idx - WINDOW), min(len(mm_sorted), idx + WINDOW + 1))
+            if j != idx
+        ]
+        if not neighbors:
+            continue
+        neighbor_med = sorted(neighbors)[len(neighbors) // 2]
+        if neighbor_med <= 0:
+            continue
+
+        ratio = v / neighbor_med if neighbor_med != 0 else 1
+
+        if ratio < 0.005:
+            # Valor ~1000x menor: le faltan los separadores de miles
+            corrected[mm] = round(v * 1000)
+            fixes.append(f"mm={mm}: {v} → {corrected[mm]} (×1000, separador de miles faltante)")
+        elif ratio > 200:
+            # Valor ~1000x mayor: tiene separadores de más
+            corrected[mm] = round(v / 1000, 3)
+            fixes.append(f"mm={mm}: {v} → {corrected[mm]} (÷1000, separador de miles extra)")
+
+    return corrected, fixes
 
 # ── Validación ───────────────────────────────────────────────────────────────
 
@@ -281,7 +358,7 @@ def has_decimals(vols: dict) -> bool:
 
 def generate_excel(vols: dict, tank_name: str, cert_number: str,
                    validation: dict, jump_warnings: list[str],
-                   passes_info: str = "") -> bytes:
+                   passes_info: str = "", scale_fixes: list[str] = None) -> bytes:
     wb = Workbook()
 
     # ── Hoja principal ───────────────────────────────────────────────────────
@@ -412,6 +489,14 @@ def generate_excel(vols: dict, tank_name: str, cert_number: str,
         vrow(r, "SALTOS DETECTADOS", "", bold=True, color="0000CC"); r += 1
         for w in jump_warnings:
             vrow(r, "", w, color="0000CC"); r += 1
+        r += 1
+
+    if scale_fixes:
+        vrow(r, "CORRECCIONES DE ESCALA", f"{len(scale_fixes)} valor(es)", bold=True, color="8B008B"); r += 1
+        for f in scale_fixes[:20]:
+            vrow(r, "", f, color="8B008B"); r += 1
+        if len(scale_fixes) > 20:
+            vrow(r, "", f"... y {len(scale_fixes)-20} más", color="8B008B"); r += 1
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -467,8 +552,10 @@ def main():
                 page_results.append((i, img, rows))
                 st.write(f"  → {len(rows)} filas extraídas.")
 
-            all_rows_1 = [r for _, _, rows in page_results for r in rows]
-            vols, jump_warns = build_vols(all_rows_1)
+            vols, jump_warns = build_vols(page_results)
+            vols, scale_fixes = normalize_scale(vols)
+            if scale_fixes:
+                st.info(f"Escala corregida en {len(scale_fixes)} valores (separador de miles).")
             validation_1 = validate_vols(vols)
             p1_label = "Pasada 1 completa — sin errores" if validation_1["ok"] else f"Pasada 1 completa — {len(validation_1['errors'])} error(es)"
             status1.update(label=p1_label, state="complete")
@@ -491,8 +578,10 @@ def main():
                     page_results[page_num - 1] = (page_num, img, new_rows)
                     st.write(f"  → {len(new_rows)} filas extraídas (antes: {len(page_results[page_num-1][2])}).")
 
-                all_rows_2 = [r for _, _, rows in page_results for r in rows]
-                vols, jump_warns = build_vols(all_rows_2)
+                vols, jump_warns = build_vols(page_results)
+                vols, scale_fixes = normalize_scale(vols)
+                if scale_fixes:
+                    st.info(f"Escala corregida en {len(scale_fixes)} valores (separador de miles).")
                 validation_2 = validate_vols(vols)
                 p2_label = "Pasada 2 completa — sin errores" if validation_2["ok"] else f"Pasada 2 completa — {len(validation_2['errors'])} error(es) restantes"
                 status2.update(label=p2_label, state="complete")
@@ -502,7 +591,7 @@ def main():
 
         st.write("Generando Excel…")
         excel_bytes = generate_excel(vols, tank_name, cert_number or "—",
-                                     validation, jump_warns, passes_info)
+                                     validation, jump_warns, passes_info, scale_fixes)
 
         # ── Reporte de validación ─────────────────────────────────────────────
         st.subheader("Reporte de validación")
