@@ -25,7 +25,7 @@ EXTRACT_PROMPT = """Esta imagen contiene una tabla de calibración de tanque ind
 La tabla tiene este formato:
 - Primera columna: valor base en mm (0, 10, 20, 30, ...)
 - Columnas 0 a 9: los 10 mm individuales de esa fila (base+0 a base+9)
-- Valores en dm³ (pueden ser enteros o con hasta 3 decimales)
+- Valores en dm³
 
 Extraé TODOS los datos en este JSON exacto:
 {
@@ -35,11 +35,25 @@ Extraé TODOS los datos en este JSON exacto:
   ]
 }
 
-Reglas estrictas:
-- Copiá exactamente los números que ves, sin redondear ni interpolar
-- Si una celda está vacía (última fila incompleta), usá null
-- Si la página no contiene tabla de datos (solo carátula o texto), devolvé {"rows": []}
-- Respondé ÚNICAMENTE con el JSON, sin texto adicional ni bloques de código"""
+Reglas CRÍTICAS — leé con atención:
+
+NÚMEROS:
+- El punto (.) es separador de MILES, NO decimal. Ejemplos:
+    788.068 → devolvé el entero 788068
+    1.160.362 → devolvé el entero 1160362
+    27.344 → si solo hay UN punto y el número es pequeño, es decimal: devolvé 27.344
+- Si hay DOS o más puntos en un número (ej: 1.160.362), siempre es entero: quitá los puntos y devolvé el número entero.
+
+NÚMEROS DE PÁGINA y ENCABEZADOS:
+- La imagen puede tener números de página (ej: "Página 12", "12", "101") impresos fuera de la tabla.
+- IGNORÁ completamente cualquier número de página, encabezado, pie de página, firma o texto que NO sea parte de la tabla de datos.
+- Los números de página NO son datos de la tabla.
+
+FORMATO:
+- Cada fila tiene EXACTAMENTE 10 valores (uno por cada columna 0-9). Nunca más, nunca menos (salvo null al final de la última fila incompleta).
+- Si una celda está vacía (última fila incompleta), usá null.
+- Si la página no contiene tabla de datos (solo carátula o texto), devolvé {"rows": []}.
+- Respondé ÚNICAMENTE con el JSON, sin texto adicional ni bloques de código."""
 
 
 def extract_page(client: anthropic.Anthropic, image, page_num: int) -> list[dict]:
@@ -75,14 +89,35 @@ def extract_page(client: anthropic.Anthropic, image, page_num: int) -> list[dict
 
 # ── Construcción del diccionario mm→dm³ ─────────────────────────────────────
 
-def build_vols(all_rows: list[dict]) -> dict[int, float]:
+def build_vols(all_rows: list[dict]) -> tuple[dict[int, float], list[str]]:
+    """Devuelve (vols, warnings). Detecta y repara saltos imposibles de base_mm."""
+    warnings_list = []
     vols = {}
+    prev_base = None
+
     for row in all_rows:
         base = int(row["base_mm"])
-        for i, v in enumerate(row["values"]):
+
+        # Detectar salto imposible: base_mm debería avanzar de a 10
+        if prev_base is not None and base != prev_base + 10:
+            expected = prev_base + 10
+            # Si el salto es múltiplo de 10 pero incorrecto, probablemente
+            # el número de página fue sumado al mm correcto
+            offset = base - expected
+            if offset > 0 and base > expected:
+                warnings_list.append(
+                    f"⚠️ Salto detectado: se esperaba base_mm={expected} pero se recibió {base} "
+                    f"(diferencia: {offset}). Corregido automáticamente."
+                )
+                base = expected  # reparar
+
+        prev_base = base
+
+        for i, v in enumerate(row["values"][:10]):  # máximo 10 valores
             if v is not None:
                 vols[base + i] = v
-    return vols
+
+    return vols, warnings_list
 
 
 def has_decimals(vols: dict) -> bool:
@@ -236,7 +271,9 @@ def main():
                 st.stop()
 
             st.write("Generando Excel…")
-            vols = build_vols(all_rows)
+            vols, warns = build_vols(all_rows)
+            for w in warns:
+                st.warning(w)
             excel_bytes = generate_excel(vols, tank_name, cert_number or "—")
 
             status.update(label="¡Listo!", state="complete")
