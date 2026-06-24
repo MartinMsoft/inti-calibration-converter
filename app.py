@@ -9,8 +9,9 @@ from pdf2image import convert_from_bytes
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
-MODEL_FAST   = "claude-haiku-4-5-20251001"   # 1ª pasada: rápido y barato
-MODEL_PRECISE = "claude-sonnet-4-6"           # 2ª pasada: mayor precisión OCR
+MODEL_FAST    = "claude-haiku-4-5-20251001"
+MODEL_PRECISE = "claude-sonnet-4-6"
+BATCH_SIZE    = 5   # paginas por llamada API (contexto cruzado entre paginas)
 
 # ── Helpers de imagen ────────────────────────────────────────────────────────
 
@@ -22,16 +23,16 @@ def image_to_base64(image) -> str:
     image.save(buf, format="PNG")
     return base64.standard_b64encode(buf.getvalue()).decode("utf-8")
 
-# ── Prompts ──────────────────────────────────────────────────────────────────
+# ── Prompt ───────────────────────────────────────────────────────────────────
 
-BASE_PROMPT = """Esta imagen contiene una tabla de calibración de tanque industrial certificada por INTI (Argentina).
+PROMPT = """Las imagenes adjuntas son paginas CONSECUTIVAS de una tabla de calibracion de tanque industrial certificada por INTI (Argentina).
 
 La tabla tiene este formato:
 - Primera columna: valor base en mm (0, 10, 20, 30, ...)
 - Columnas 0 a 9: los 10 mm individuales de esa fila (base+0 a base+9)
-- Valores en dm³
+- Valores en dm3
 
-Extraé TODOS los datos en este JSON exacto:
+Extrae TODOS los datos de TODAS las paginas en orden, en UN SOLO JSON:
 {
   "rows": [
     {"base_mm": 0, "values": [v0, v1, v2, v3, v4, v5, v6, v7, v8, v9]},
@@ -39,51 +40,63 @@ Extraé TODOS los datos en este JSON exacto:
   ]
 }
 
-Reglas CRÍTICAS:
+Reglas CRITICAS:
 
-NÚMEROS:
-- El punto (.) es separador de MILES, NO decimal.
-    788.068 → entero 788068
-    1.160.362 → entero 1160362
-    27.344 → si hay UN solo punto y el número es pequeño (<10000), es decimal: 27.344
-- Si hay DOS o más puntos en un número, siempre es entero: quitá los puntos.
+NUMEROS - el punto (.) es separador de MILES, NO decimal:
+  788.068   -> entero 788068
+  1.160.362 -> entero 1160362
+  Si hay DOS o mas puntos, siempre es entero: quita los puntos.
+  Si hay UN solo punto y el numero es menor a 10000, es decimal: 27.344
+
+CONSISTENCIA entre paginas:
+  Los volumenes siempre aumentan de fila en fila. Nunca disminuyen.
+  Si el ultimo valor de una pagina es 137914, la siguiente pagina debe continuar
+  en la misma escala: 138016, 138118, etc. (NO 138.016 ni 138016000).
 
 IGNORAR completamente:
-- Números de página ("Página 12", "12", "101", etc.)
-- Encabezados, pies de página, firmas, sellos, logos
-- Cualquier texto fuera de la tabla de datos
+  Numeros de pagina, encabezados, pies de pagina, firmas, sellos, logos.
+  Todo texto fuera de la tabla de datos.
 
-FORMATO ESTRICTO:
-- Cada fila tiene EXACTAMENTE 10 valores. Nunca más (salvo null al final de la última fila).
-- Si una celda está vacía, usá null.
-- Si la página no tiene tabla (carátula, texto, firma), devolvé {"rows": []}.
-- Respondé ÚNICAMENTE con el JSON, sin texto adicional ni bloques de código."""
+FORMATO:
+  Cada fila tiene EXACTAMENTE 10 valores (null si la celda esta vacia).
+  No incluyas filas de paginas sin tabla (caratula, texto libre, firma).
+  Responde UNICAMENTE con el JSON, sin texto adicional ni bloques de codigo."""
+
 
 def make_retry_prompt(expected_start: int, expected_end: int) -> str:
-    return BASE_PROMPT + f"""
+    return PROMPT + f"""
 
-CONTEXTO IMPORTANTE PARA ESTA PÁGINA:
-Esta página debería contener datos para el rango de mm aproximadamente {expected_start} a {expected_end}.
-Si ves filas con esos valores de mm, extraélas TODAS con máxima precisión.
-Revisá cada dígito con cuidado — es una tabla de calibración industrial crítica."""
+ATENCION ESPECIAL PARA ESTE BLOQUE:
+Se esperan datos en el rango aproximado mm={expected_start} a mm={expected_end}.
+Revisa cada digito con maxima precision. Los volumenes deben ser enteros grandes
+(ej: 306592, 306694...), NO decimales (ej: 306.592). Es una calibracion industrial critica."""
 
-# ── Extracción ───────────────────────────────────────────────────────────────
+# ── Extraccion por lotes ─────────────────────────────────────────────────────
 
-def extract_page(client: anthropic.Anthropic, image, page_num: int,
-                 model: str = MODEL_FAST, prompt: str = BASE_PROMPT) -> list[dict]:
-    image_b64 = image_to_base64(image)
+def extract_batch(client: anthropic.Anthropic, batch: list,
+                  model: str = MODEL_FAST, prompt: str = PROMPT) -> list[dict]:
+    """
+    Extrae datos de un lote de paginas consecutivas en UNA sola llamada API.
+    batch = lista de (page_num, image)
+    Retorna lista de rows (todos los de todas las paginas del lote en orden).
+    """
+    content = []
+    for page_num, img in batch:
+        content.append({"type": "text", "text": f"[Pagina {page_num}]"})
+        content.append({
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png",
+                       "data": image_to_base64(img)}
+        })
+    content.append({"type": "text", "text": prompt})
+
+    page_nums = [p for p, _ in batch]
+    label = f"{page_nums[0]}-{page_nums[-1]}"
     try:
         response = client.messages.create(
             model=model,
             max_tokens=4096,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "image",
-                     "source": {"type": "base64", "media_type": "image/png", "data": image_b64}},
-                    {"type": "text", "text": prompt},
-                ],
-            }],
+            messages=[{"role": "user", "content": content}],
         )
         raw = response.content[0].text.strip()
         raw = re.sub(r"^```[a-z]*\n?", "", raw)
@@ -91,74 +104,28 @@ def extract_page(client: anthropic.Anthropic, image, page_num: int,
         data = json.loads(raw)
         return data.get("rows", [])
     except Exception as e:
-        st.warning(f"Página {page_num}: error al procesar ({e}). Se omite.")
+        st.warning(f"Paginas {label}: error ({e}). Se omite.")
         return []
 
-# ── Construcción del diccionario mm→dm³ ─────────────────────────────────────
+# ── Construccion del diccionario mm->dm3 ─────────────────────────────────────
 
-def build_vols(page_results: list) -> tuple[dict[int, float], list[str]]:
-    """
-    Construye el diccionario mm→dm³ procesando página por página.
-    Detecta y corrige offsets sistemáticos de base_mm causados por números de página.
-    """
-    jump_warnings = []
+def build_vols(all_rows: list[dict]) -> dict[int, float]:
+    """Convierte la lista plana de rows en el diccionario mm->volumen."""
     vols = {}
-    prev_base = None
+    for row in all_rows:
+        base = int(row["base_mm"])
+        for i, v in enumerate(row["values"][:10]):
+            if v is not None:
+                vols[base + i] = v
+    return vols
 
-    for page_num, _img, rows in page_results:
-        if not rows:
-            continue
-
-        # Detectar offset sistemático: si las primeras filas de esta página
-        # tienen todas el mismo desplazamiento vs el esperado, es error de página
-        if prev_base is not None and len(rows) >= 2:
-            expected_start = prev_base + 10
-            actual_start   = int(rows[0]["base_mm"])
-            offset         = actual_start - expected_start
-
-            if offset != 0:
-                # Verificar que el offset es consistente en todas las filas de la página
-                offsets = [int(r["base_mm"]) - (expected_start + 10 * i)
-                           for i, r in enumerate(rows)]
-                if len(set(offsets)) == 1:
-                    # Offset uniforme → corregir toda la página
-                    jump_warnings.append(
-                        f"Página {page_num}: offset sistemático de {offset} mm en base_mm "
-                        f"(número de página contaminó la lectura). Corregido automáticamente."
-                    )
-                    rows = [{"base_mm": int(r["base_mm"]) - offset,
-                             "values": r["values"]} for r in rows]
-                else:
-                    # Offset irregular → reportar sin corregir
-                    jump_warnings.append(
-                        f"Salto en base_mm página {page_num}: se esperaba {expected_start} "
-                        f"pero el PDF entregó {actual_start} (diferencia: {offset}). "
-                        f"Verificar manualmente."
-                    )
-
-        for row in rows:
-            base = int(row["base_mm"])
-            if prev_base is not None and base != prev_base + 10 and not jump_warnings:
-                jump_warnings.append(
-                    f"Salto en base_mm: se esperaba {prev_base + 10} pero se recibió {base}."
-                )
-            prev_base = base
-            for i, v in enumerate(row["values"][:10]):
-                if v is not None:
-                    vols[base + i] = v
-
-    return vols, jump_warnings
-
+# ── Correccion de escala ──────────────────────────────────────────────────────
 
 def fix_scale_errors(vols: dict) -> tuple[dict[int, float], list[str]]:
     """
-    Corrige errores de escala ×1000 causados por leer el separador de miles
-    argentino (punto) como decimal. Funciona incluso cuando páginas enteras
-    están en escala incorrecta, usando restauración de monotonía:
-    - Pasada directa: si vol[mm] < vol[mm-1], intenta ×1000 y verifica que
-      el resultado sea plausible (>= anterior y <= anterior×2).
-    - Pasada inversa (antes de directa): si vol[mm] > vol[mm+1]×500,
-      intenta ÷1000.
+    Corrige errores x1000 (punto de miles leido como decimal) usando monotonia.
+    Pasada inversa: si vol[mm] > vol[mm+1]*500 -> divide por 1000.
+    Pasada directa: si vol[mm] < vol[mm-1] y vol[mm]*1000 restaura monotonia -> multiplica.
     """
     mm_sorted = sorted(vols.keys())
     if len(mm_sorted) < 2:
@@ -167,19 +134,17 @@ def fix_scale_errors(vols: dict) -> tuple[dict[int, float], list[str]]:
     corrected = dict(vols)
     fixes = []
 
-    # Pasada inversa: corrige valores demasiado grandes (÷1000)
     for i in range(len(mm_sorted) - 2, -1, -1):
         mm      = mm_sorted[i]
         mm_next = mm_sorted[i + 1]
         v       = corrected[mm]
         v_next  = corrected[mm_next]
-        if v > v_next * 500:          # claramente fuera de escala
+        if v > v_next * 500:
             v_down = round(v / 1000, 3)
             if v_down <= v_next and v_down >= v_next / 2:
                 corrected[mm] = v_down
-                fixes.append(f"mm={mm}: {v} -> {v_down} (div1000, separador de miles extra)")
+                fixes.append(f"mm={mm}: {v} -> {v_down} (div1000)")
 
-    # Pasada directa: corrige valores demasiado pequenos (x1000)
     for i in range(1, len(mm_sorted)):
         mm      = mm_sorted[i]
         mm_prev = mm_sorted[i - 1]
@@ -187,14 +152,13 @@ def fix_scale_errors(vols: dict) -> tuple[dict[int, float], list[str]]:
         v_prev  = corrected[mm_prev]
         if v < v_prev:
             v_up = v * 1000
-            # Plausible si restaura monotonia y no supera 2x el valor anterior
             if v_up >= v_prev and v_up <= v_prev * 2:
                 corrected[mm] = v_up
-                fixes.append(f"mm={mm}: {v} -> {v_up} (x1000, separador de miles faltante)")
+                fixes.append(f"mm={mm}: {v} -> {v_up} (x1000)")
 
     return corrected, fixes
 
-# ── Validación ───────────────────────────────────────────────────────────────
+# ── Validacion ────────────────────────────────────────────────────────────────
 
 def validate_vols(vols: dict) -> dict:
     errors, warnings = [], []
@@ -217,7 +181,7 @@ def validate_vols(vols: dict) -> dict:
         groups.append((start, prev))
         ranges_str = ", ".join(str(a) if a == b else f"{a}-{b}" for a, b in groups[:10])
         if len(groups) > 10:
-            ranges_str += f" ... y {len(groups)-10} rangos más"
+            ranges_str += f" ... y {len(groups)-10} rangos mas"
         errors.append(f"MM faltantes ({len(missing)} valores): {ranges_str}")
 
     # 2. Volumen siempre creciente
@@ -230,10 +194,10 @@ def validate_vols(vols: dict) -> dict:
         prev_vol = vol
     if non_mono:
         detail = "; ".join(f"mm={mm}: {pv:.3f}->{v:.3f}" for mm, pv, v in non_mono[:5])
-        if len(non_mono) > 5: detail += f" ... y {len(non_mono)-5} más"
+        if len(non_mono) > 5: detail += f" ... y {len(non_mono)-5} mas"
         errors.append(f"Volumen decrece en {len(non_mono)} punto(s): {detail}")
 
-    # 3. Incrementos anómalos — comparación contra mediana local (ventana ±30 mm)
+    # 3. Incrementos anomalos (mediana local, ventana +-30 mm)
     inc_map: dict[int, float] = {}
     for i in range(1, len(mm_sorted)):
         if mm_sorted[i] == mm_sorted[i - 1] + 1:
@@ -242,8 +206,8 @@ def validate_vols(vols: dict) -> dict:
     outliers = []
     if inc_map:
         inc_keys = sorted(inc_map.keys())
-        WINDOW    = 30    # mm vecinos a considerar en cada lado
-        THRESHOLD = 4.0   # ratio máximo tolerado vs mediana local
+        WINDOW    = 30
+        THRESHOLD = 4.0
 
         def median(lst):
             s = sorted(lst)
@@ -251,7 +215,6 @@ def validate_vols(vols: dict) -> dict:
 
         for idx, mm in enumerate(inc_keys):
             actual = inc_map[mm]
-            # Mediana local excluyendo el punto actual
             neighbors = [
                 inc_map[inc_keys[j]]
                 for j in range(max(0, idx - WINDOW), min(len(inc_keys), idx + WINDOW + 1))
@@ -268,14 +231,12 @@ def validate_vols(vols: dict) -> dict:
 
         if outliers:
             detail = "; ".join(
-                f"mm={mm}: Δ={act:.3f} (esperado≈{exp:.3f}, ratio={rat:.1f}x)"
+                f"mm={mm}: D={act:.3f} (esp~{exp:.3f}, ratio={rat:.1f}x)"
                 for mm, act, exp, rat in outliers[:8]
             )
             if len(outliers) > 8:
-                detail += f" ... y {len(outliers) - 8} más"
-            errors.append(
-                f"Incremento proporcional anómalo en {len(outliers)} punto(s): {detail}"
-            )
+                detail += f" ... y {len(outliers) - 8} mas"
+            errors.append(f"Incremento anomalo en {len(outliers)} punto(s): {detail}")
 
     bad_mm = set(missing)
     bad_mm.update(mm for mm, _, _ in non_mono)
@@ -283,7 +244,7 @@ def validate_vols(vols: dict) -> dict:
 
     stats = {
         "total_mm": len(vols),
-        "rango": f"{min_mm} – {max_mm} mm",
+        "rango": f"{min_mm} - {max_mm} mm",
         "vol_min": f"{min(vols.values()):.3f}",
         "vol_max": f"{max(vols.values()):.3f}",
         "faltantes": len(missing),
@@ -291,81 +252,59 @@ def validate_vols(vols: dict) -> dict:
     return {"ok": len(errors) == 0, "errors": errors, "warnings": warnings,
             "stats": stats, "bad_mm": bad_mm, "missing": missing}
 
-# ── Lógica de retry ──────────────────────────────────────────────────────────
+# ── Logica de retry ───────────────────────────────────────────────────────────
 
-def find_pages_to_retry(page_results: list, validation: dict) -> set[int]:
-    """Determina qué páginas necesitan re-procesarse con el modelo preciso."""
-    bad_mm = validation["bad_mm"]
-    missing = set(validation["missing"])
-    retry = set()
+def find_batches_to_retry(batch_results: list, validation: dict) -> set[int]:
+    """
+    Retorna indices (en batch_results) de lotes que deben re-procesarse con Sonnet.
+    batch_results = [(batch_idx, [(page_num, img)], rows), ...]
+    """
+    bad_mm    = validation["bad_mm"]
+    missing_s = set(validation["missing"])
+    retry_idx = set()
 
-    for page_num, _img, rows in page_results:
-        # Páginas que devolvieron 0 filas
+    for b_idx, batch, rows in batch_results:
+        # Lotes sin ninguna fila
         if not rows:
-            retry.add(page_num)
+            retry_idx.add(b_idx)
             continue
-        # Páginas que contienen mm problemáticos
+        # Lotes con mm problematicos
         for row in rows:
             base = int(row["base_mm"])
             if any((base + i) in bad_mm for i in range(10)):
-                retry.add(page_num)
+                retry_idx.add(b_idx)
                 break
 
-    # Páginas adyacentes a zonas de mm faltantes
-    # (la página anterior/siguiente al gap puede tener el borde corrupto)
-    if missing:
-        min_missing, max_missing = min(missing), max(missing)
-        for page_num, _img, rows in page_results:
-            if not rows:
-                continue
+    # Lotes adyacentes a gaps
+    if missing_s:
+        min_m, max_m = min(missing_s), max(missing_s)
+        for b_idx, batch, rows in batch_results:
+            if not rows: continue
             bases = [int(r["base_mm"]) for r in rows]
-            page_max = max(bases) + 9
-            page_min = min(bases)
-            if page_max >= min_missing - 20 or page_min <= max_missing + 20:
-                retry.add(page_num)
+            if max(bases) + 9 >= min_m - 20 or min(bases) <= max_m + 20:
+                retry_idx.add(b_idx)
 
-    return retry
+    return retry_idx
 
-def estimate_mm_range(page_num: int, page_results: list) -> tuple[int, int]:
-    """Estima el rango de mm esperado para una página basándose en sus vecinas."""
-    _pn, _img, rows = page_results[page_num - 1]
-    if rows:
-        bases = [int(r["base_mm"]) for r in rows]
-        return min(bases), max(bases) + 9
 
-    # Si la página está vacía, interpolar desde vecinos
-    prev_max, next_min = None, None
-    for i in range(page_num - 2, -1, -1):
-        _, _, r = page_results[i]
-        if r:
-            prev_max = max(int(x["base_mm"]) for x in r) + 9
-            break
-    for i in range(page_num, len(page_results)):
-        _, _, r = page_results[i]
-        if r:
-            next_min = min(int(x["base_mm"]) for x in r)
-            break
+def batch_mm_range(rows: list) -> tuple[int, int]:
+    """Rango mm cubierto por un lote de rows."""
+    if not rows:
+        return 0, 0
+    bases = [int(r["base_mm"]) for r in rows]
+    return min(bases), max(bases) + 9
 
-    if prev_max is not None and next_min is not None:
-        return prev_max + 1, next_min - 1
-    if prev_max is not None:
-        return prev_max + 1, prev_max + 200
-    if next_min is not None:
-        return next_min - 200, next_min - 1
-    return 0, 9999
-
-# ── Generación del Excel ─────────────────────────────────────────────────────
+# ── Generacion del Excel ──────────────────────────────────────────────────────
 
 def has_decimals(vols: dict) -> bool:
     sample = list(vols.values())[:30]
     return any(isinstance(v, float) and v != int(v) for v in sample)
 
 def generate_excel(vols: dict, tank_name: str, cert_number: str,
-                   validation: dict, jump_warnings: list[str],
-                   passes_info: str = "", scale_fixes: list[str] = None) -> bytes:
+                   validation: dict, passes_info: str = "",
+                   scale_fixes: list[str] = None) -> bytes:
     wb = Workbook()
 
-    # ── Hoja principal ───────────────────────────────────────────────────────
     ws = wb.active
     ws.title = f"TK-{tank_name}"
 
@@ -376,22 +315,21 @@ def generate_excel(vols: dict, tank_name: str, cert_number: str,
     thin   = Side(style="thin", color="AAAAAA")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
     center = Alignment(horizontal="center", vertical="center")
-    data_font = Font(name="Arial", size=9)
 
     ws.merge_cells("A1:B1")
-    ws["A1"] = f"TABLA DE LLENADO — TANQUE {tank_name}  |  TAGSA"
+    ws["A1"] = f"TABLA DE LLENADO - TANQUE {tank_name}  |  TAGSA"
     ws["A1"].font = Font(name="Arial", bold=True, color="FFFFFF", size=12)
     ws["A1"].fill = TITLE_FILL
     ws["A1"].alignment = center
     ws.row_dimensions[1].height = 22
 
-    estado = "✅ APROBADA" if validation["ok"] else "❌ CON ERRORES — ver hoja VALIDACIÓN"
+    estado = "APROBADA" if validation["ok"] else "CON ERRORES - ver hoja VALIDACION"
     info = [
-        ("Razón Social:", "Antivari S.A."),
-        ("Tanque Nº:", tank_name),
-        ("Certificado INTI Nº:", cert_number),
-        ("Unidad:", "dm³"),
-        ("Validación:", estado),
+        ("Razon Social:", "Antivari S.A."),
+        ("Tanque N:", tank_name),
+        ("Certificado INTI N:", cert_number),
+        ("Unidad:", "dm3"),
+        ("Validacion:", estado),
     ]
     for i, (lbl, val) in enumerate(info):
         r = i + 2
@@ -402,7 +340,7 @@ def generate_excel(vols: dict, tank_name: str, cert_number: str,
         ws.row_dimensions[r].height = 14
 
     header_row = len(info) + 2
-    for c, h in [(1, "mm"), (2, "dm³")]:
+    for c, h in [(1, "mm"), (2, "dm3")]:
         cell = ws.cell(header_row, c, h)
         cell.font      = Font(name="Arial", bold=True, color="FFFFFF", size=11)
         cell.fill      = HEADER_FILL
@@ -413,21 +351,18 @@ def generate_excel(vols: dict, tank_name: str, cert_number: str,
     ws.column_dimensions["B"].width = 16
     ws.freeze_panes = f"A{header_row + 1}"
 
-    num_format = "#,##0.000" if has_decimals(vols) else "#,##0"
-    bad_mm    = validation.get("bad_mm", set())
-    missing_s = set(validation.get("missing", []))
-    MISSING_FILL = PatternFill("solid", start_color="FF8C00")  # naranja
+    num_format   = "#,##0.000" if has_decimals(vols) else "#,##0"
+    bad_mm       = validation.get("bad_mm", set())
+    MISSING_FILL = PatternFill("solid", start_color="FF8C00")
 
     row = header_row + 1
     for mm in range(0, max(vols.keys()) + 1):
         vol = vols.get(mm)
 
         if vol is None:
-            # Fila faltante — siempre visible en el Excel
             c1 = ws.cell(row, 1, mm)
             c1.font = Font(name="Arial", size=9, bold=True, color="FFFFFF")
             c1.alignment = center; c1.border = border; c1.fill = MISSING_FILL
-
             c2 = ws.cell(row, 2, "FALTANTE")
             c2.font = Font(name="Arial", size=9, bold=True, color="FFFFFF")
             c2.alignment = center; c2.border = border; c2.fill = MISSING_FILL
@@ -452,8 +387,8 @@ def generate_excel(vols: dict, tank_name: str, cert_number: str,
 
         row += 1
 
-    # ── Hoja VALIDACIÓN ──────────────────────────────────────────────────────
-    wv = wb.create_sheet("VALIDACIÓN")
+    # ── Hoja VALIDACION ──────────────────────────────────────────────────────
+    wv = wb.create_sheet("VALIDACION")
     wv.column_dimensions["A"].width = 22
     wv.column_dimensions["B"].width = 90
 
@@ -462,18 +397,18 @@ def generate_excel(vols: dict, tank_name: str, cert_number: str,
         wv.cell(r, 2, val).font = Font(name="Arial", bold=bold, size=9, color=color)
 
     r = 1
-    vrow(r, "REPORTE DE VALIDACIÓN", f"Tanque {tank_name}", bold=True); r += 1
+    vrow(r, "REPORTE DE VALIDACION", f"Tanque {tank_name}", bold=True); r += 1
     vrow(r, "Fecha",        datetime.now().strftime("%Y-%m-%d %H:%M")); r += 1
     vrow(r, "Certificado",  cert_number); r += 1
     vrow(r, "Procesamiento", passes_info); r += 1
-    vrow(r, "Total mm",     str(validation["stats"].get("total_mm", "—"))); r += 1
-    vrow(r, "Rango",        validation["stats"].get("rango", "—")); r += 1
-    vrow(r, "Volumen mín",  validation["stats"].get("vol_min", "—") + " dm³"); r += 1
-    vrow(r, "Volumen máx",  validation["stats"].get("vol_max", "—") + " dm³"); r += 1
-    vrow(r, "MM faltantes", str(validation["stats"].get("faltantes", "—"))); r += 1
+    vrow(r, "Total mm",     str(validation["stats"].get("total_mm", "-"))); r += 1
+    vrow(r, "Rango",        validation["stats"].get("rango", "-")); r += 1
+    vrow(r, "Volumen min",  validation["stats"].get("vol_min", "-") + " dm3"); r += 1
+    vrow(r, "Volumen max",  validation["stats"].get("vol_max", "-") + " dm3"); r += 1
+    vrow(r, "MM faltantes", str(validation["stats"].get("faltantes", "-"))); r += 1
     r += 1
 
-    result_txt = "APROBADA" if validation["ok"] else "FALLIDA — REVISAR FILAS EN ROJO"
+    result_txt = "APROBADA" if validation["ok"] else "FALLIDA - REVISAR FILAS EN ROJO"
     result_col = "008000" if validation["ok"] else "FF0000"
     vrow(r, "RESULTADO", result_txt, bold=True, color=result_col); r += 2
 
@@ -489,25 +424,19 @@ def generate_excel(vols: dict, tank_name: str, cert_number: str,
             vrow(r, "", w, color="CC6600"); r += 1
         r += 1
 
-    if jump_warnings:
-        vrow(r, "SALTOS DETECTADOS", "", bold=True, color="0000CC"); r += 1
-        for w in jump_warnings:
-            vrow(r, "", w, color="0000CC"); r += 1
-        r += 1
-
     if scale_fixes:
-        vrow(r, "CORRECCIONES DE ESCALA", f"{len(scale_fixes)} valor(es)", bold=True, color="8B008B"); r += 1
-        for f in scale_fixes[:20]:
-            vrow(r, "", f, color="8B008B"); r += 1
+        vrow(r, "CORRECCIONES ESCALA", f"{len(scale_fixes)} valor(es)", bold=True, color="8B008B"); r += 1
+        for f_txt in scale_fixes[:20]:
+            vrow(r, "", f_txt, color="8B008B"); r += 1
         if len(scale_fixes) > 20:
-            vrow(r, "", f"... y {len(scale_fixes)-20} más", color="8B008B"); r += 1
+            vrow(r, "", f"... y {len(scale_fixes)-20} mas", color="8B008B"); r += 1
 
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
     return buf.getvalue()
 
-# ── UI ───────────────────────────────────────────────────────────────────────
+# ── UI ────────────────────────────────────────────────────────────────────────
 
 def get_api_key() -> str:
     try:
@@ -517,11 +446,11 @@ def get_api_key() -> str:
 
 def main():
     st.set_page_config(
-        page_title="Conversor Tablas INTI — TAGSA",
-        page_icon="📊",
+        page_title="Conversor Tablas INTI - TAGSA",
+        page_icon="=",
         layout="centered",
     )
-    st.title("📊 Conversor Tablas de Calibración INTI")
+    st.title("Conversor Tablas de Calibracion INTI")
     st.caption("Antivari S.A.")
     st.divider()
 
@@ -533,110 +462,132 @@ def main():
 
     col1, col2 = st.columns(2)
     with col1:
-        tank_name   = st.text_input("Nº de Tanque",         placeholder="ej: TK-81")
+        tank_name   = st.text_input("N de Tanque",        placeholder="ej: TK-81")
     with col2:
-        cert_number = st.text_input("Nº Certificado INTI",  placeholder="ej: INTI 2623")
+        cert_number = st.text_input("N Certificado INTI", placeholder="ej: INTI 2623")
 
-    uploaded = st.file_uploader("Subí el PDF del certificado INTI", type="pdf")
+    uploaded = st.file_uploader("Subi el PDF del certificado INTI", type="pdf")
     ready = bool(api_key and tank_name and uploaded)
 
     if st.button("Convertir a Excel", type="primary", disabled=not ready):
         client = anthropic.Anthropic(api_key=api_key)
+        pdf_bytes = uploaded.read()
 
-        # ── PASADA 1: Haiku (todas las páginas) ──────────────────────────────
-        with st.status("Pasada 1 — lectura rápida (Haiku)…", expanded=True) as status1:
-            st.write("Convirtiendo páginas a imagen…")
-            images = pdf_to_images(uploaded.read())
-            st.write(f"PDF tiene {len(images)} página(s).")
+        # ── PASADA 1: Haiku (lotes de BATCH_SIZE paginas) ───────────────────
+        with st.status(f"Pasada 1 - lectura rapida (lotes de {BATCH_SIZE} paginas)...",
+                       expanded=True) as status1:
+            st.write("Convirtiendo PDF a imagenes...")
+            images = pdf_to_images(pdf_bytes)
+            total_pages = len(images)
+            st.write(f"PDF tiene {total_pages} pagina(s). Procesando en lotes de {BATCH_SIZE}...")
 
-            page_results = []   # (page_num, image, rows)
-            for i, img in enumerate(images, 1):
-                st.write(f"Página {i}/{len(images)}…")
-                rows = extract_page(client, img, i, model=MODEL_FAST)
-                page_results.append((i, img, rows))
+            batch_results = []   # lista de (batch_idx, [(page_num, img)], rows)
+            all_rows_p1  = []
+
+            for b_start in range(0, total_pages, BATCH_SIZE):
+                b_end    = min(b_start + BATCH_SIZE, total_pages)
+                b_idx    = b_start // BATCH_SIZE
+                batch    = [(b_start + j + 1, images[b_start + j]) for j in range(b_end - b_start)]
+                pnums    = [p for p, _ in batch]
+                label    = f"{pnums[0]}-{pnums[-1]}" if len(pnums) > 1 else str(pnums[0])
+                st.write(f"Paginas {label} ({len(batch)} imagenes en una sola llamada)...")
+                rows = extract_batch(client, batch, model=MODEL_FAST, prompt=PROMPT)
+                batch_results.append((b_idx, batch, rows))
+                all_rows_p1.extend(rows)
                 st.write(f"  -> {len(rows)} filas extraidas.")
 
-            vols, jump_warns = build_vols(page_results)
-            vols, scale_fixes = fix_scale_errors(vols)
-            if scale_fixes:
-                st.info(f"Escala corregida en {len(scale_fixes)} valores (separador de miles).")
-            validation_1 = validate_vols(vols)
-            p1_label = "Pasada 1 completa — sin errores" if validation_1["ok"] else f"Pasada 1 completa — {len(validation_1['errors'])} error(es)"
-            status1.update(label=p1_label, state="complete")
+            vols           = build_vols(all_rows_p1)
+            vols, sf1      = fix_scale_errors(vols)
+            if sf1:
+                st.info(f"Escala corregida en {len(sf1)} valores.")
+            validation_1   = validate_vols(vols)
+            p1_ok          = validation_1["ok"]
+            p1_lbl         = "Pasada 1 completa - sin errores" if p1_ok else f"Pasada 1: {len(validation_1['errors'])} error(es)"
+            status1.update(label=p1_lbl, state="complete")
 
-        # ── PASADA 2: Sonnet (solo páginas con problemas) ────────────────────
-        pages_to_retry = find_pages_to_retry(page_results, validation_1)
-        passes_info = f"1 pasada (Haiku) — sin errores"
+        # ── PASADA 2: Sonnet (solo lotes con problemas) ──────────────────────
+        batches_to_retry = find_batches_to_retry(batch_results, validation_1)
+        passes_info = "1 pasada (Haiku, lotes)"
 
-        if pages_to_retry and not validation_1["ok"]:
-            passes_info = f"2 pasadas — Haiku + Sonnet en {len(pages_to_retry)} página(s)"
-            with st.status(f"Pasada 2 — re-procesando {len(pages_to_retry)} página(s) con Sonnet…", expanded=True) as status2:
-                for page_num in sorted(pages_to_retry):
-                    exp_start, exp_end = estimate_mm_range(page_num, page_results)
-                    st.write(f"Re-procesando página {page_num} (mm ~{exp_start}–{exp_end})…")
+        if batches_to_retry and not p1_ok:
+            passes_info = f"2 pasadas - Haiku + Sonnet en {len(batches_to_retry)} lote(s)"
+            with st.status(f"Pasada 2 - re-procesando {len(batches_to_retry)} lote(s) con Sonnet...",
+                           expanded=True) as status2:
+
+                for b_idx, batch, old_rows in batch_results:
+                    if b_idx not in batches_to_retry:
+                        continue
+                    exp_start, exp_end = batch_mm_range(old_rows)
+                    pnums = [p for p, _ in batch]
+                    label = f"{pnums[0]}-{pnums[-1]}" if len(pnums) > 1 else str(pnums[0])
+                    st.write(f"Re-procesando paginas {label} con Sonnet (mm ~{exp_start}-{exp_end})...")
                     retry_prompt = make_retry_prompt(exp_start, exp_end)
-                    _, img, _ = page_results[page_num - 1]
-                    new_rows = extract_page(client, img, page_num,
-                                            model=MODEL_PRECISE, prompt=retry_prompt)
-                    # Reemplazar los rows de esa página
-                    page_results[page_num - 1] = (page_num, img, new_rows)
-                    st.write(f"  -> {len(new_rows)} filas extraidas (antes: {len(page_results[page_num-1][2])}).")
+                    new_rows = extract_batch(client, batch, model=MODEL_PRECISE,
+                                            prompt=retry_prompt)
+                    # Reemplazar en batch_results
+                    for i, (bi, bt, _) in enumerate(batch_results):
+                        if bi == b_idx:
+                            batch_results[i] = (bi, bt, new_rows)
+                            break
+                    st.write(f"  -> {len(new_rows)} filas extraidas (antes: {len(old_rows)}).")
 
-                vols, jump_warns = build_vols(page_results)
-                vols, scale_fixes = fix_scale_errors(vols)
-                if scale_fixes:
-                    st.info(f"Escala corregida en {len(scale_fixes)} valores (separador de miles).")
+                all_rows_p2 = []
+                for _, _, rows in batch_results:
+                    all_rows_p2.extend(rows)
+
+                vols         = build_vols(all_rows_p2)
+                vols, sf2    = fix_scale_errors(vols)
+                if sf2:
+                    st.info(f"Escala corregida en {len(sf2)} valores.")
                 validation_2 = validate_vols(vols)
-                p2_label = "Pasada 2 completa — sin errores" if validation_2["ok"] else f"Pasada 2 completa — {len(validation_2['errors'])} error(es) restantes"
-                status2.update(label=p2_label, state="complete")
-            validation = validation_2
+                p2_lbl       = "Pasada 2 completa - sin errores" if validation_2["ok"] else f"Pasada 2: {len(validation_2['errors'])} error(es) restantes"
+                status2.update(label=p2_lbl, state="complete")
+            validation   = validation_2
+            scale_fixes  = sf2
         else:
-            validation = validation_1
+            validation   = validation_1
+            scale_fixes  = sf1
 
-        st.write("Generando Excel…")
-        excel_bytes = generate_excel(vols, tank_name, cert_number or "—",
-                                     validation, jump_warns, passes_info, scale_fixes)
+        st.write("Generando Excel...")
+        excel_bytes = generate_excel(vols, tank_name, cert_number or "-",
+                                     validation, passes_info, scale_fixes)
 
-        # ── Reporte de validación ─────────────────────────────────────────────
-        st.subheader("Reporte de validación")
+        # ── Reporte ──────────────────────────────────────────────────────────
+        st.subheader("Reporte de validacion")
         s = validation["stats"]
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Total mm",   s["total_mm"])
-        c2.metric("Rango",      s["rango"])
-        c3.metric("Vol. mín",   s["vol_min"] + " dm³")
-        c4.metric("Vol. máx",   s["vol_max"] + " dm³")
+        c1.metric("Total mm",  s["total_mm"])
+        c2.metric("Rango",     s["rango"])
+        c3.metric("Vol. min",  s["vol_min"] + " dm3")
+        c4.metric("Vol. max",  s["vol_max"] + " dm3")
 
         if validation["ok"] and not validation["warnings"]:
-            st.success("✅ Validación APROBADA — todos los controles pasaron.")
+            st.success("Validacion APROBADA - todos los controles pasaron.")
         elif validation["ok"]:
-            st.warning("⚠️ Aprobada con advertencias — revisá los detalles.")
+            st.warning("Aprobada con advertencias - revisa los detalles.")
         else:
-            st.error("❌ Validación FALLIDA — el Excel tiene errores (filas en rojo). Revisá antes de usar.")
+            st.error("Validacion FALLIDA - el Excel tiene errores (filas en rojo). Revisa antes de usar.")
 
         if validation["errors"]:
-            with st.expander("❌ Errores", expanded=True):
+            with st.expander("Errores", expanded=True):
                 for e in validation["errors"]:
                     st.error(e)
         if validation["warnings"]:
-            with st.expander("⚠️ Advertencias"):
+            with st.expander("Advertencias"):
                 for w in validation["warnings"]:
-                    st.warning(w)
-        if jump_warns:
-            with st.expander("⚠️ Saltos de página detectados"):
-                for w in jump_warns:
                     st.warning(w)
 
         st.divider()
         fname = f"TK-{tank_name}_Tabla_Llenado.xlsx"
         st.download_button(
-            label="⬇️ Descargar Excel",
+            label="Descargar Excel",
             data=excel_bytes,
             file_name=fname,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             type="primary" if validation["ok"] else "secondary",
         )
         if not validation["ok"]:
-            st.caption("⚠️ El archivo tiene errores. Las filas problemáticas están marcadas en ROJO. Verificá contra el PDF original antes de subir al sistema.")
+            st.caption("El archivo tiene errores. Las filas problematicas estan marcadas en ROJO. Verifica contra el PDF original antes de subir al sistema.")
 
 if __name__ == "__main__":
     main()
