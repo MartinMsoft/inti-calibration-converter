@@ -177,9 +177,9 @@ def fix_scale_errors(vols: dict) -> tuple[dict[int, float], list[str]]:
             v_down = round(v / 1000, 3)
             if v_down <= v_next and v_down >= v_next / 2:
                 corrected[mm] = v_down
-                fixes.append(f"mm={mm}: {v} → {v_down} (÷1000, separador de miles extra)")
+                fixes.append(f"mm={mm}: {v} -> {v_down} (div1000, separador de miles extra)")
 
-    # Pasada directa: corrige valores demasiado pequeños (×1000)
+    # Pasada directa: corrige valores demasiado pequenos (x1000)
     for i in range(1, len(mm_sorted)):
         mm      = mm_sorted[i]
         mm_prev = mm_sorted[i - 1]
@@ -187,10 +187,10 @@ def fix_scale_errors(vols: dict) -> tuple[dict[int, float], list[str]]:
         v_prev  = corrected[mm_prev]
         if v < v_prev:
             v_up = v * 1000
-            # Plausible si restaura monotonía y no supera 2× el valor anterior
+            # Plausible si restaura monotonia y no supera 2x el valor anterior
             if v_up >= v_prev and v_up <= v_prev * 2:
                 corrected[mm] = v_up
-                fixes.append(f"mm={mm}: {v} → {v_up} (×1000, separador de miles faltante)")
+                fixes.append(f"mm={mm}: {v} -> {v_up} (x1000, separador de miles faltante)")
 
     return corrected, fixes
 
@@ -229,7 +229,7 @@ def validate_vols(vols: dict) -> dict:
             non_mono.append((mm, prev_vol, vol))
         prev_vol = vol
     if non_mono:
-        detail = "; ".join(f"mm={mm}: {pv:.3f}→{v:.3f}" for mm, pv, v in non_mono[:5])
+        detail = "; ".join(f"mm={mm}: {pv:.3f}->{v:.3f}" for mm, pv, v in non_mono[:5])
         if len(non_mono) > 5: detail += f" ... y {len(non_mono)-5} más"
         errors.append(f"Volumen decrece en {len(non_mono)} punto(s): {detail}")
 
@@ -554,7 +554,7 @@ def main():
                 st.write(f"Página {i}/{len(images)}…")
                 rows = extract_page(client, img, i, model=MODEL_FAST)
                 page_results.append((i, img, rows))
-                st.write(f"  → {len(rows)} filas extraídas.")
+                st.write(f"  -> {len(rows)} filas extraidas.")
 
             vols, jump_warns = build_vols(page_results)
             vols, scale_fixes = fix_scale_errors(vols)
@@ -580,7 +580,7 @@ def main():
                                             model=MODEL_PRECISE, prompt=retry_prompt)
                     # Reemplazar los rows de esa página
                     page_results[page_num - 1] = (page_num, img, new_rows)
-                    st.write(f"  → {len(new_rows)} filas extraídas (antes: {len(page_results[page_num-1][2])}).")
+                    st.write(f"  -> {len(new_rows)} filas extraidas (antes: {len(page_results[page_num-1][2])}).")
 
                 vols, jump_warns = build_vols(page_results)
                 vols, scale_fixes = fix_scale_errors(vols)
