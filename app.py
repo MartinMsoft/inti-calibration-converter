@@ -4,9 +4,13 @@ import json
 import io
 import base64
 import re
+from datetime import datetime
 from pdf2image import convert_from_bytes
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+
+MODEL_FAST   = "claude-haiku-4-5-20251001"   # 1ª pasada: rápido y barato
+MODEL_PRECISE = "claude-sonnet-4-6"           # 2ª pasada: mayor precisión OCR
 
 # ── Helpers de imagen ────────────────────────────────────────────────────────
 
@@ -18,9 +22,9 @@ def image_to_base64(image) -> str:
     image.save(buf, format="PNG")
     return base64.standard_b64encode(buf.getvalue()).decode("utf-8")
 
-# ── Extracción con Claude Vision ─────────────────────────────────────────────
+# ── Prompts ──────────────────────────────────────────────────────────────────
 
-EXTRACT_PROMPT = """Esta imagen contiene una tabla de calibración de tanque industrial certificada por INTI (Argentina).
+BASE_PROMPT = """Esta imagen contiene una tabla de calibración de tanque industrial certificada por INTI (Argentina).
 
 La tabla tiene este formato:
 - Primera columna: valor base en mm (0, 10, 20, 30, ...)
@@ -35,133 +39,107 @@ Extraé TODOS los datos en este JSON exacto:
   ]
 }
 
-Reglas CRÍTICAS — leé con atención:
+Reglas CRÍTICAS:
 
 NÚMEROS:
-- El punto (.) es separador de MILES, NO decimal. Ejemplos:
-    788.068 → devolvé el entero 788068
-    1.160.362 → devolvé el entero 1160362
-    27.344 → si solo hay UN punto y el número es pequeño, es decimal: devolvé 27.344
-- Si hay DOS o más puntos en un número (ej: 1.160.362), siempre es entero: quitá los puntos y devolvé el número entero.
+- El punto (.) es separador de MILES, NO decimal.
+    788.068 → entero 788068
+    1.160.362 → entero 1160362
+    27.344 → si hay UN solo punto y el número es pequeño (<10000), es decimal: 27.344
+- Si hay DOS o más puntos en un número, siempre es entero: quitá los puntos.
 
-NÚMEROS DE PÁGINA y ENCABEZADOS:
-- La imagen puede tener números de página (ej: "Página 12", "12", "101") impresos fuera de la tabla.
-- IGNORÁ completamente cualquier número de página, encabezado, pie de página, firma o texto que NO sea parte de la tabla de datos.
-- Los números de página NO son datos de la tabla.
+IGNORAR completamente:
+- Números de página ("Página 12", "12", "101", etc.)
+- Encabezados, pies de página, firmas, sellos, logos
+- Cualquier texto fuera de la tabla de datos
 
-FORMATO:
-- Cada fila tiene EXACTAMENTE 10 valores (uno por cada columna 0-9). Nunca más, nunca menos (salvo null al final de la última fila incompleta).
-- Si una celda está vacía (última fila incompleta), usá null.
-- Si la página no contiene tabla de datos (solo carátula o texto), devolvé {"rows": []}.
+FORMATO ESTRICTO:
+- Cada fila tiene EXACTAMENTE 10 valores. Nunca más (salvo null al final de la última fila).
+- Si una celda está vacía, usá null.
+- Si la página no tiene tabla (carátula, texto, firma), devolvé {"rows": []}.
 - Respondé ÚNICAMENTE con el JSON, sin texto adicional ni bloques de código."""
 
+def make_retry_prompt(expected_start: int, expected_end: int) -> str:
+    return BASE_PROMPT + f"""
 
-def extract_page(client: anthropic.Anthropic, image, page_num: int) -> list[dict]:
+CONTEXTO IMPORTANTE PARA ESTA PÁGINA:
+Esta página debería contener datos para el rango de mm aproximadamente {expected_start} a {expected_end}.
+Si ves filas con esos valores de mm, extraélas TODAS con máxima precisión.
+Revisá cada dígito con cuidado — es una tabla de calibración industrial crítica."""
+
+# ── Extracción ───────────────────────────────────────────────────────────────
+
+def extract_page(client: anthropic.Anthropic, image, page_num: int,
+                 model: str = MODEL_FAST, prompt: str = BASE_PROMPT) -> list[dict]:
     image_b64 = image_to_base64(image)
-    response = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=4096,
-        messages=[{
-            "role": "user",
-            "content": [
-                {
-                    "type": "image",
-                    "source": {"type": "base64", "media_type": "image/png", "data": image_b64},
-                },
-                {"type": "text", "text": EXTRACT_PROMPT},
-            ],
-        }],
-    )
-
-    raw = response.content[0].text.strip()
-
-    # Limpiar posibles bloques markdown que Claude agrega a veces
-    raw = re.sub(r"^```[a-z]*\n?", "", raw)
-    raw = re.sub(r"\n?```$", "", raw)
-
     try:
+        response = client.messages.create(
+            model=model,
+            max_tokens=4096,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image",
+                     "source": {"type": "base64", "media_type": "image/png", "data": image_b64}},
+                    {"type": "text", "text": prompt},
+                ],
+            }],
+        )
+        raw = response.content[0].text.strip()
+        raw = re.sub(r"^```[a-z]*\n?", "", raw)
+        raw = re.sub(r"\n?```$", "", raw)
         data = json.loads(raw)
         return data.get("rows", [])
-    except json.JSONDecodeError:
-        st.warning(f"Página {page_num}: no se pudo parsear la respuesta. Se omite.")
+    except Exception as e:
+        st.warning(f"Página {page_num}: error al procesar ({e}). Se omite.")
         return []
-
 
 # ── Construcción del diccionario mm→dm³ ─────────────────────────────────────
 
 def build_vols(all_rows: list[dict]) -> tuple[dict[int, float], list[str]]:
-    """
-    Devuelve (vols, jump_warnings).
-    Detecta saltos imposibles de base_mm y los reporta SIN corregir,
-    para no colocar volúmenes en posiciones incorrectas.
-    """
     jump_warnings = []
     vols = {}
     prev_base = None
-
     for row in all_rows:
         base = int(row["base_mm"])
-
         if prev_base is not None and base != prev_base + 10:
-            expected = prev_base + 10
             jump_warnings.append(
-                f"Salto en base_mm: se esperaba {expected} pero el PDF entregó {base} "
-                f"(diferencia: {base - expected}). Verificar manualmente esa zona del PDF."
+                f"Salto en base_mm: se esperaba {prev_base + 10} pero el PDF entregó {base} "
+                f"(diferencia: {base - (prev_base + 10)}). Verificar manualmente."
             )
-
         prev_base = base
-
         for i, v in enumerate(row["values"][:10]):
             if v is not None:
                 vols[base + i] = v
-
     return vols, jump_warnings
 
-
-def has_decimals(vols: dict) -> bool:
-    sample = list(vols.values())[:30]
-    return any(isinstance(v, float) and v != int(v) for v in sample)
-
-
-# ── Validación automática ────────────────────────────────────────────────────
+# ── Validación ───────────────────────────────────────────────────────────────
 
 def validate_vols(vols: dict) -> dict:
-    """
-    Valida la integridad del diccionario mm→dm³.
-    Retorna {"ok": bool, "errors": [...], "warnings": [...], "stats": {...}}
-    """
-    errors   = []
-    warnings = []
-
+    errors, warnings = [], []
     if not vols:
-        return {"ok": False, "errors": ["No hay datos."], "warnings": [], "stats": {}}
+        return {"ok": False, "errors": ["No hay datos."], "warnings": [],
+                "stats": {}, "bad_mm": set(), "missing": []}
 
     mm_sorted = sorted(vols.keys())
     min_mm, max_mm = mm_sorted[0], mm_sorted[-1]
-    total_expected = max_mm - min_mm + 1
 
-    # 1. MM correlativos: ningún valor faltante
+    # 1. MM faltantes
     missing = [mm for mm in range(min_mm, max_mm + 1) if mm not in vols]
     if missing:
-        # Agrupar rangos contiguos para no listar miles de números
-        groups = []
-        start = missing[0]
-        prev  = missing[0]
+        groups, start, prev = [], missing[0], missing[0]
         for m in missing[1:]:
             if m == prev + 1:
                 prev = m
             else:
-                groups.append((start, prev))
-                start = prev = m
+                groups.append((start, prev)); start = prev = m
         groups.append((start, prev))
-        ranges_str = ", ".join(
-            str(a) if a == b else f"{a}-{b}" for a, b in groups[:10]
-        )
+        ranges_str = ", ".join(str(a) if a == b else f"{a}-{b}" for a, b in groups[:10])
         if len(groups) > 10:
-            ranges_str += f" ... y {len(groups) - 10} rangos más"
+            ranges_str += f" ... y {len(groups)-10} rangos más"
         errors.append(f"MM faltantes ({len(missing)} valores): {ranges_str}")
 
-    # 2. Volumen siempre creciente (no puede disminuir)
+    # 2. Volumen siempre creciente
     non_mono = []
     prev_vol = None
     for mm in mm_sorted:
@@ -170,32 +148,25 @@ def validate_vols(vols: dict) -> dict:
             non_mono.append((mm, prev_vol, vol))
         prev_vol = vol
     if non_mono:
-        sample = non_mono[:5]
-        detail = "; ".join(f"mm={mm}: {pv:.3f}→{v:.3f}" for mm, pv, v in sample)
-        if len(non_mono) > 5:
-            detail += f" ... y {len(non_mono) - 5} más"
+        detail = "; ".join(f"mm={mm}: {pv:.3f}→{v:.3f}" for mm, pv, v in non_mono[:5])
+        if len(non_mono) > 5: detail += f" ... y {len(non_mono)-5} más"
         errors.append(f"Volumen decrece en {len(non_mono)} punto(s): {detail}")
 
-    # 3. Saltos bruscos de volumen entre mm consecutivos
-    increments = []
+    # 3. Incrementos anómalos
+    increments, outliers = [], []
     for i in range(1, len(mm_sorted)):
-        mm_curr = mm_sorted[i]
-        mm_prev = mm_sorted[i - 1]
-        if mm_curr == mm_prev + 1:  # solo comparar mm consecutivos
-            increments.append(vols[mm_curr] - vols[mm_prev])
-
+        if mm_sorted[i] == mm_sorted[i-1] + 1:
+            increments.append((mm_sorted[i], vols[mm_sorted[i]] - vols[mm_sorted[i-1]]))
     if increments:
-        avg_inc = sum(increments) / len(increments)
-        # Alertar si algún incremento es >20x el promedio o negativo
-        outliers = [
-            (mm_sorted[i + 1], increments[i])
-            for i in range(len(increments))
-            if increments[i] > avg_inc * 20 or increments[i] < 0
-        ]
+        avg = sum(d for _, d in increments) / len(increments)
+        outliers = [(mm, d) for mm, d in increments if d > avg * 20 or d < 0]
         if outliers:
-            sample = outliers[:5]
-            detail = "; ".join(f"mm={mm}: Δ={d:.3f}" for mm, d in sample)
+            detail = "; ".join(f"mm={mm}: Δ={d:.3f}" for mm, d in outliers[:5])
             warnings.append(f"Incrementos anómalos en {len(outliers)} punto(s): {detail}")
+
+    bad_mm = set(missing)
+    bad_mm.update(mm for mm, _, _ in non_mono)
+    bad_mm.update(mm for mm, _ in outliers)
 
     stats = {
         "total_mm": len(vols),
@@ -204,26 +175,81 @@ def validate_vols(vols: dict) -> dict:
         "vol_max": f"{max(vols.values()):.3f}",
         "faltantes": len(missing),
     }
+    return {"ok": len(errors) == 0, "errors": errors, "warnings": warnings,
+            "stats": stats, "bad_mm": bad_mm, "missing": missing}
 
-    # Conjunto de mm problemáticos para marcar en rojo en el Excel
-    bad_mm: set[int] = set(missing)
-    bad_mm.update(mm for mm, _, _ in non_mono)
-    bad_mm.update(mm for mm, _ in outliers) if increments else None
+# ── Lógica de retry ──────────────────────────────────────────────────────────
 
-    return {
-        "ok": len(errors) == 0,
-        "errors": errors,
-        "warnings": warnings,
-        "stats": stats,
-        "bad_mm": bad_mm,
-    }
+def find_pages_to_retry(page_results: list, validation: dict) -> set[int]:
+    """Determina qué páginas necesitan re-procesarse con el modelo preciso."""
+    bad_mm = validation["bad_mm"]
+    missing = set(validation["missing"])
+    retry = set()
 
+    for page_num, _img, rows in page_results:
+        # Páginas que devolvieron 0 filas
+        if not rows:
+            retry.add(page_num)
+            continue
+        # Páginas que contienen mm problemáticos
+        for row in rows:
+            base = int(row["base_mm"])
+            if any((base + i) in bad_mm for i in range(10)):
+                retry.add(page_num)
+                break
+
+    # Páginas adyacentes a zonas de mm faltantes
+    # (la página anterior/siguiente al gap puede tener el borde corrupto)
+    if missing:
+        min_missing, max_missing = min(missing), max(missing)
+        for page_num, _img, rows in page_results:
+            if not rows:
+                continue
+            bases = [int(r["base_mm"]) for r in rows]
+            page_max = max(bases) + 9
+            page_min = min(bases)
+            if page_max >= min_missing - 20 or page_min <= max_missing + 20:
+                retry.add(page_num)
+
+    return retry
+
+def estimate_mm_range(page_num: int, page_results: list) -> tuple[int, int]:
+    """Estima el rango de mm esperado para una página basándose en sus vecinas."""
+    _pn, _img, rows = page_results[page_num - 1]
+    if rows:
+        bases = [int(r["base_mm"]) for r in rows]
+        return min(bases), max(bases) + 9
+
+    # Si la página está vacía, interpolar desde vecinos
+    prev_max, next_min = None, None
+    for i in range(page_num - 2, -1, -1):
+        _, _, r = page_results[i]
+        if r:
+            prev_max = max(int(x["base_mm"]) for x in r) + 9
+            break
+    for i in range(page_num, len(page_results)):
+        _, _, r = page_results[i]
+        if r:
+            next_min = min(int(x["base_mm"]) for x in r)
+            break
+
+    if prev_max is not None and next_min is not None:
+        return prev_max + 1, next_min - 1
+    if prev_max is not None:
+        return prev_max + 1, prev_max + 200
+    if next_min is not None:
+        return next_min - 200, next_min - 1
+    return 0, 9999
 
 # ── Generación del Excel ─────────────────────────────────────────────────────
 
+def has_decimals(vols: dict) -> bool:
+    sample = list(vols.values())[:30]
+    return any(isinstance(v, float) and v != int(v) for v in sample)
+
 def generate_excel(vols: dict, tank_name: str, cert_number: str,
-                   validation: dict, jump_warnings: list[str]) -> bytes:
-    from datetime import datetime
+                   validation: dict, jump_warnings: list[str],
+                   passes_info: str = "") -> bytes:
     wb = Workbook()
 
     # ── Hoja principal ───────────────────────────────────────────────────────
@@ -256,8 +282,7 @@ def generate_excel(vols: dict, tank_name: str, cert_number: str,
     ]
     for i, (lbl, val) in enumerate(info):
         r = i + 2
-        c1 = ws.cell(r, 1, lbl)
-        c1.font = Font(name="Arial", bold=True, size=9)
+        ws.cell(r, 1, lbl).font = Font(name="Arial", bold=True, size=9)
         c2 = ws.cell(r, 2, val)
         c2.font = Font(name="Arial", size=9,
                        color="FF0000" if "ERRORES" in str(val) else "000000")
@@ -285,20 +310,17 @@ def generate_excel(vols: dict, tank_name: str, cert_number: str,
             continue
         is_bad = mm in bad_mm
         is_alt = (mm // 10) % 2 == 1
-
         fill = ERROR_FILL if is_bad else (ALT_FILL if is_alt else None)
         font_color = "FFFFFF" if is_bad else "000000"
 
         c1 = ws.cell(row, 1, mm)
         c1.font = Font(name="Arial", size=9, bold=is_bad, color=font_color)
-        c1.alignment = center
-        c1.border = border
+        c1.alignment = center; c1.border = border
         if fill: c1.fill = fill
 
         c2 = ws.cell(row, 2, vol)
         c2.font = Font(name="Arial", size=9, bold=is_bad, color=font_color)
-        c2.alignment = center
-        c2.border = border
+        c2.alignment = center; c2.border = border
         c2.number_format = num_format
         if fill: c2.fill = fill
 
@@ -306,57 +328,54 @@ def generate_excel(vols: dict, tank_name: str, cert_number: str,
 
     # ── Hoja VALIDACIÓN ──────────────────────────────────────────────────────
     wv = wb.create_sheet("VALIDACIÓN")
-    wv.column_dimensions["A"].width = 20
-    wv.column_dimensions["B"].width = 80
+    wv.column_dimensions["A"].width = 22
+    wv.column_dimensions["B"].width = 90
 
-    def val_row(r, label, value, bold=False, color="000000"):
-        c1 = wv.cell(r, 1, label)
-        c1.font = Font(name="Arial", bold=bold, size=9)
-        c2 = wv.cell(r, 2, value)
-        c2.font = Font(name="Arial", bold=bold, size=9, color=color)
+    def vrow(r, lbl, val, bold=False, color="000000"):
+        wv.cell(r, 1, lbl).font = Font(name="Arial", bold=bold, size=9)
+        wv.cell(r, 2, val).font = Font(name="Arial", bold=bold, size=9, color=color)
 
     r = 1
-    val_row(r, "REPORTE DE VALIDACIÓN", f"Tanque {tank_name}", bold=True); r += 1
-    val_row(r, "Fecha generación", datetime.now().strftime("%Y-%m-%d %H:%M")); r += 1
-    val_row(r, "Certificado INTI", cert_number); r += 1
-    val_row(r, "Total mm procesados", str(validation["stats"]["total_mm"])); r += 1
-    val_row(r, "Rango", validation["stats"]["rango"]); r += 1
-    val_row(r, "Volumen mín (dm³)", validation["stats"]["vol_min"]); r += 1
-    val_row(r, "Volumen máx (dm³)", validation["stats"]["vol_max"]); r += 1
-    val_row(r, "MM faltantes", str(validation["stats"]["faltantes"])); r += 1
+    vrow(r, "REPORTE DE VALIDACIÓN", f"Tanque {tank_name}", bold=True); r += 1
+    vrow(r, "Fecha",        datetime.now().strftime("%Y-%m-%d %H:%M")); r += 1
+    vrow(r, "Certificado",  cert_number); r += 1
+    vrow(r, "Procesamiento", passes_info); r += 1
+    vrow(r, "Total mm",     str(validation["stats"].get("total_mm", "—"))); r += 1
+    vrow(r, "Rango",        validation["stats"].get("rango", "—")); r += 1
+    vrow(r, "Volumen mín",  validation["stats"].get("vol_min", "—") + " dm³"); r += 1
+    vrow(r, "Volumen máx",  validation["stats"].get("vol_max", "—") + " dm³"); r += 1
+    vrow(r, "MM faltantes", str(validation["stats"].get("faltantes", "—"))); r += 1
     r += 1
 
-    result_txt = "APROBADA" if validation["ok"] else "FALLIDA — NO USAR"
+    result_txt = "APROBADA" if validation["ok"] else "FALLIDA — REVISAR FILAS EN ROJO"
     result_col = "008000" if validation["ok"] else "FF0000"
-    val_row(r, "RESULTADO", result_txt, bold=True, color=result_col); r += 2
+    vrow(r, "RESULTADO", result_txt, bold=True, color=result_col); r += 2
 
     if validation["errors"]:
-        val_row(r, "ERRORES", "", bold=True, color="FF0000"); r += 1
+        vrow(r, "ERRORES", "", bold=True, color="FF0000"); r += 1
         for e in validation["errors"]:
-            val_row(r, "", e, color="FF0000"); r += 1
+            vrow(r, "", e, color="FF0000"); r += 1
         r += 1
 
     if validation["warnings"]:
-        val_row(r, "ADVERTENCIAS", "", bold=True, color="CC6600"); r += 1
+        vrow(r, "ADVERTENCIAS", "", bold=True, color="CC6600"); r += 1
         for w in validation["warnings"]:
-            val_row(r, "", w, color="CC6600"); r += 1
+            vrow(r, "", w, color="CC6600"); r += 1
         r += 1
 
     if jump_warnings:
-        val_row(r, "SALTOS DE PÁGINA", "", bold=True, color="0000CC"); r += 1
+        vrow(r, "SALTOS DETECTADOS", "", bold=True, color="0000CC"); r += 1
         for w in jump_warnings:
-            val_row(r, "", w, color="0000CC"); r += 1
+            vrow(r, "", w, color="0000CC"); r += 1
 
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
     return buf.getvalue()
 
-
 # ── UI ───────────────────────────────────────────────────────────────────────
 
 def get_api_key() -> str:
-    """Lee la API key desde secrets de Streamlit o pide al usuario."""
     try:
         return st.secrets["ANTHROPIC_API_KEY"]
     except Exception:
@@ -368,113 +387,119 @@ def main():
         page_icon="📊",
         layout="centered",
     )
-
     st.title("📊 Conversor Tablas de Calibración INTI")
     st.caption("Antivari S.A.")
     st.divider()
 
-    # API key
     secret_key = get_api_key()
-    if secret_key:
-        api_key = secret_key
-    else:
-        api_key = st.text_input(
-            "API Key de Anthropic",
-            type="password",
-            help="Ingresá tu clave de API. Para no escribirla cada vez, configurala como secret en Streamlit Cloud.",
-        )
+    api_key = secret_key or st.text_input(
+        "API Key de Anthropic", type="password",
+        help="Configurala como secret en Streamlit Cloud para no escribirla cada vez."
+    )
 
     col1, col2 = st.columns(2)
     with col1:
-        tank_name = st.text_input("Nº de Tanque", placeholder="ej: TK-81")
+        tank_name   = st.text_input("Nº de Tanque",         placeholder="ej: TK-81")
     with col2:
-        cert_number = st.text_input("Nº Certificado INTI", placeholder="ej: INTI 2623")
+        cert_number = st.text_input("Nº Certificado INTI",  placeholder="ej: INTI 2623")
 
     uploaded = st.file_uploader("Subí el PDF del certificado INTI", type="pdf")
-
     ready = bool(api_key and tank_name and uploaded)
 
     if st.button("Convertir a Excel", type="primary", disabled=not ready):
         client = anthropic.Anthropic(api_key=api_key)
 
-        with st.status("Procesando PDF...", expanded=True) as status:
+        # ── PASADA 1: Haiku (todas las páginas) ──────────────────────────────
+        with st.status("Pasada 1 — lectura rápida (Haiku)…", expanded=True) as status1:
             st.write("Convirtiendo páginas a imagen…")
             images = pdf_to_images(uploaded.read())
             st.write(f"PDF tiene {len(images)} página(s).")
 
-            all_rows: list[dict] = []
+            page_results = []   # (page_num, image, rows)
             for i, img in enumerate(images, 1):
-                st.write(f"Leyendo página {i}/{len(images)}…")
-                rows = extract_page(client, img, i)
-                all_rows.extend(rows)
+                st.write(f"Página {i}/{len(images)}…")
+                rows = extract_page(client, img, i, model=MODEL_FAST)
+                page_results.append((i, img, rows))
                 st.write(f"  → {len(rows)} filas extraídas.")
 
-            if not all_rows:
-                status.update(label="Error", state="error")
-                st.error("No se encontraron datos en el PDF. Verificá que sea una tabla de calibración INTI.")
-                st.stop()
+            all_rows_1 = [r for _, _, rows in page_results for r in rows]
+            vols, jump_warns = build_vols(all_rows_1)
+            validation_1 = validate_vols(vols)
+            status1.update(label=f"Pasada 1 completa — {'✅ sin errores' if validation_1['ok'] else f'❌ {len(validation_1[\"errors\"])} error(es)'}", state="complete")
 
-            st.write("Generando Excel…")
-            vols, jump_warns = build_vols(all_rows)
+        # ── PASADA 2: Sonnet (solo páginas con problemas) ────────────────────
+        pages_to_retry = find_pages_to_retry(page_results, validation_1)
+        passes_info = f"1 pasada (Haiku) — sin errores"
 
-            st.write("Validando integridad de los datos…")
-            validation = validate_vols(vols)
-            excel_bytes = generate_excel(vols, tank_name, cert_number or "—",
-                                         validation, jump_warns)
+        if pages_to_retry and not validation_1["ok"]:
+            passes_info = f"2 pasadas — Haiku + Sonnet en {len(pages_to_retry)} página(s)"
+            with st.status(f"Pasada 2 — re-procesando {len(pages_to_retry)} página(s) con Sonnet…", expanded=True) as status2:
+                for page_num in sorted(pages_to_retry):
+                    exp_start, exp_end = estimate_mm_range(page_num, page_results)
+                    st.write(f"Re-procesando página {page_num} (mm ~{exp_start}–{exp_end})…")
+                    retry_prompt = make_retry_prompt(exp_start, exp_end)
+                    _, img, _ = page_results[page_num - 1]
+                    new_rows = extract_page(client, img, page_num,
+                                            model=MODEL_PRECISE, prompt=retry_prompt)
+                    # Reemplazar los rows de esa página
+                    page_results[page_num - 1] = (page_num, img, new_rows)
+                    st.write(f"  → {len(new_rows)} filas extraídas (antes: {len(page_results[page_num-1][2])}).")
 
-            status.update(label="¡Listo!", state="complete")
+                all_rows_2 = [r for _, _, rows in page_results for r in rows]
+                vols, jump_warns = build_vols(all_rows_2)
+                validation_2 = validate_vols(vols)
+                status2.update(
+                    label=f"Pasada 2 completa — {'✅ sin errores' if validation_2['ok'] else f'❌ {len(validation_2[\"errors\"])} error(es) restantes'}",
+                    state="complete"
+                )
+            validation = validation_2
+        else:
+            validation = validation_1
 
-        # ── Reporte de validación ──────────────────────────────────────────
+        st.write("Generando Excel…")
+        excel_bytes = generate_excel(vols, tank_name, cert_number or "—",
+                                     validation, jump_warns, passes_info)
+
+        # ── Reporte de validación ─────────────────────────────────────────────
         st.subheader("Reporte de validación")
-
         s = validation["stats"]
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Total mm procesados", s["total_mm"])
-        col2.metric("Rango", s["rango"])
-        col3.metric("Volumen mín", s["vol_min"] + " dm³")
-        col4.metric("Volumen máx", s["vol_max"] + " dm³")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Total mm",   s["total_mm"])
+        c2.metric("Rango",      s["rango"])
+        c3.metric("Vol. mín",   s["vol_min"] + " dm³")
+        c4.metric("Vol. máx",   s["vol_max"] + " dm³")
 
         if validation["ok"] and not validation["warnings"]:
-            st.success("✅ Validación APROBADA — todos los controles pasaron correctamente.")
-        elif validation["ok"] and validation["warnings"]:
-            st.warning("⚠️ Validación con ADVERTENCIAS — revisá los detalles antes de usar el archivo.")
+            st.success("✅ Validación APROBADA — todos los controles pasaron.")
+        elif validation["ok"]:
+            st.warning("⚠️ Aprobada con advertencias — revisá los detalles.")
         else:
-            st.error("❌ Validación FALLIDA — el archivo tiene errores. NO usar hasta corregir.")
+            st.error("❌ Validación FALLIDA — el Excel tiene errores (filas en rojo). Revisá antes de usar.")
 
         if validation["errors"]:
-            with st.expander("❌ Errores encontrados", expanded=True):
+            with st.expander("❌ Errores", expanded=True):
                 for e in validation["errors"]:
                     st.error(e)
-
         if validation["warnings"]:
-            with st.expander("⚠️ Advertencias", expanded=True):
+            with st.expander("⚠️ Advertencias"):
                 for w in validation["warnings"]:
                     st.warning(w)
-
         if jump_warns:
-            with st.expander("⚠️ Saltos de página detectados (requieren verificación manual)", expanded=False):
+            with st.expander("⚠️ Saltos de página detectados"):
                 for w in jump_warns:
                     st.warning(w)
 
         st.divider()
-
         fname = f"TK-{tank_name}_Tabla_Llenado.xlsx"
-        if validation["ok"]:
-            st.download_button(
-                label="⬇️ Descargar Excel",
-                data=excel_bytes,
-                file_name=fname,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
-        else:
-            st.download_button(
-                label="⬇️ Descargar Excel igualmente (con errores)",
-                data=excel_bytes,
-                file_name=fname,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                type="secondary",
-            )
-            st.caption("⚠️ Se recomienda NO usar este archivo hasta resolver los errores indicados.")
+        st.download_button(
+            label="⬇️ Descargar Excel",
+            data=excel_bytes,
+            file_name=fname,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary" if validation["ok"] else "secondary",
+        )
+        if not validation["ok"]:
+            st.caption("⚠️ El archivo tiene errores. Las filas problemáticas están marcadas en ROJO. Verificá contra el PDF original antes de subir al sistema.")
 
 if __name__ == "__main__":
     main()
