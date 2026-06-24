@@ -150,43 +150,47 @@ def build_vols(page_results: list) -> tuple[dict[int, float], list[str]]:
     return vols, jump_warnings
 
 
-def normalize_scale(vols: dict) -> tuple[dict[int, float], list[str]]:
+def fix_scale_errors(vols: dict) -> tuple[dict[int, float], list[str]]:
     """
-    Detecta y corrige valores con escala incorrecta (×1000 o ÷1000)
-    causados por lectura errónea del separador de miles.
-    Compara cada valor contra sus vecinos inmediatos.
+    Corrige errores de escala ×1000 causados por leer el separador de miles
+    argentino (punto) como decimal. Funciona incluso cuando páginas enteras
+    están en escala incorrecta, usando restauración de monotonía:
+    - Pasada directa: si vol[mm] < vol[mm-1], intenta ×1000 y verifica que
+      el resultado sea plausible (>= anterior y <= anterior×2).
+    - Pasada inversa (antes de directa): si vol[mm] > vol[mm+1]×500,
+      intenta ÷1000.
     """
-    if len(vols) < 10:
+    mm_sorted = sorted(vols.keys())
+    if len(mm_sorted) < 2:
         return vols, []
 
-    mm_sorted = sorted(vols.keys())
     corrected = dict(vols)
     fixes = []
-    WINDOW = 5  # vecinos a consultar en cada lado
 
-    for idx, mm in enumerate(mm_sorted):
-        v = vols[mm]
-        neighbors = [
-            vols[mm_sorted[j]]
-            for j in range(max(0, idx - WINDOW), min(len(mm_sorted), idx + WINDOW + 1))
-            if j != idx
-        ]
-        if not neighbors:
-            continue
-        neighbor_med = sorted(neighbors)[len(neighbors) // 2]
-        if neighbor_med <= 0:
-            continue
+    # Pasada inversa: corrige valores demasiado grandes (÷1000)
+    for i in range(len(mm_sorted) - 2, -1, -1):
+        mm      = mm_sorted[i]
+        mm_next = mm_sorted[i + 1]
+        v       = corrected[mm]
+        v_next  = corrected[mm_next]
+        if v > v_next * 500:          # claramente fuera de escala
+            v_down = round(v / 1000, 3)
+            if v_down <= v_next and v_down >= v_next / 2:
+                corrected[mm] = v_down
+                fixes.append(f"mm={mm}: {v} → {v_down} (÷1000, separador de miles extra)")
 
-        ratio = v / neighbor_med if neighbor_med != 0 else 1
-
-        if ratio < 0.005:
-            # Valor ~1000x menor: le faltan los separadores de miles
-            corrected[mm] = round(v * 1000)
-            fixes.append(f"mm={mm}: {v} → {corrected[mm]} (×1000, separador de miles faltante)")
-        elif ratio > 200:
-            # Valor ~1000x mayor: tiene separadores de más
-            corrected[mm] = round(v / 1000, 3)
-            fixes.append(f"mm={mm}: {v} → {corrected[mm]} (÷1000, separador de miles extra)")
+    # Pasada directa: corrige valores demasiado pequeños (×1000)
+    for i in range(1, len(mm_sorted)):
+        mm      = mm_sorted[i]
+        mm_prev = mm_sorted[i - 1]
+        v       = corrected[mm]
+        v_prev  = corrected[mm_prev]
+        if v < v_prev:
+            v_up = v * 1000
+            # Plausible si restaura monotonía y no supera 2× el valor anterior
+            if v_up >= v_prev and v_up <= v_prev * 2:
+                corrected[mm] = v_up
+                fixes.append(f"mm={mm}: {v} → {v_up} (×1000, separador de miles faltante)")
 
     return corrected, fixes
 
@@ -553,7 +557,7 @@ def main():
                 st.write(f"  → {len(rows)} filas extraídas.")
 
             vols, jump_warns = build_vols(page_results)
-            vols, scale_fixes = normalize_scale(vols)
+            vols, scale_fixes = fix_scale_errors(vols)
             if scale_fixes:
                 st.info(f"Escala corregida en {len(scale_fixes)} valores (separador de miles).")
             validation_1 = validate_vols(vols)
@@ -579,7 +583,7 @@ def main():
                     st.write(f"  → {len(new_rows)} filas extraídas (antes: {len(page_results[page_num-1][2])}).")
 
                 vols, jump_warns = build_vols(page_results)
-                vols, scale_fixes = normalize_scale(vols)
+                vols, scale_fixes = fix_scale_errors(vols)
                 if scale_fixes:
                     st.info(f"Escala corregida en {len(scale_fixes)} valores (separador de miles).")
                 validation_2 = validate_vols(vols)
