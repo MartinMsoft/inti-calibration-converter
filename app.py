@@ -152,21 +152,53 @@ def validate_vols(vols: dict) -> dict:
         if len(non_mono) > 5: detail += f" ... y {len(non_mono)-5} más"
         errors.append(f"Volumen decrece en {len(non_mono)} punto(s): {detail}")
 
-    # 3. Incrementos anómalos
-    increments, outliers = [], []
+    # 3. Incrementos anómalos — comparación contra mediana local (ventana ±30 mm)
+    inc_map: dict[int, float] = {}
     for i in range(1, len(mm_sorted)):
-        if mm_sorted[i] == mm_sorted[i-1] + 1:
-            increments.append((mm_sorted[i], vols[mm_sorted[i]] - vols[mm_sorted[i-1]]))
-    if increments:
-        avg = sum(d for _, d in increments) / len(increments)
-        outliers = [(mm, d) for mm, d in increments if d > avg * 20 or d < 0]
+        if mm_sorted[i] == mm_sorted[i - 1] + 1:
+            inc_map[mm_sorted[i]] = vols[mm_sorted[i]] - vols[mm_sorted[i - 1]]
+
+    outliers = []
+    if inc_map:
+        inc_keys = sorted(inc_map.keys())
+        WINDOW    = 30    # mm vecinos a considerar en cada lado
+        THRESHOLD = 4.0   # ratio máximo tolerado vs mediana local
+
+        def median(lst):
+            s = sorted(lst)
+            return s[len(s) // 2]
+
+        for idx, mm in enumerate(inc_keys):
+            actual = inc_map[mm]
+            # Mediana local excluyendo el punto actual
+            neighbors = [
+                inc_map[inc_keys[j]]
+                for j in range(max(0, idx - WINDOW), min(len(inc_keys), idx + WINDOW + 1))
+                if j != idx and inc_map[inc_keys[j]] > 0
+            ]
+            if len(neighbors) < 5:
+                continue
+            local_med = median(neighbors)
+            if local_med <= 0:
+                continue
+            ratio = actual / local_med
+            if ratio > THRESHOLD or ratio < 1 / THRESHOLD:
+                outliers.append((mm, actual, local_med, ratio))
+
         if outliers:
-            detail = "; ".join(f"mm={mm}: Δ={d:.3f}" for mm, d in outliers[:5])
-            warnings.append(f"Incrementos anómalos en {len(outliers)} punto(s): {detail}")
+            detail = "; ".join(
+                f"mm={mm}: Δ={act:.3f} (esperado≈{exp:.3f}, ratio={rat:.1f}x)"
+                for mm, act, exp, rat in outliers[:8]
+            )
+            if len(outliers) > 8:
+                detail += f" ... y {len(outliers) - 8} más"
+            errors.append(
+                f"Incremento proporcional anómalo en {len(outliers)} punto(s): {detail}"
+            )
 
     bad_mm = set(missing)
     bad_mm.update(mm for mm, _, _ in non_mono)
-    bad_mm.update(mm for mm, _ in outliers)
+    bad_mm.update(mm for mm, _, _, _ in outliers)
 
     stats = {
         "total_mm": len(vols),
