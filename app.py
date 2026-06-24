@@ -90,34 +90,32 @@ def extract_page(client: anthropic.Anthropic, image, page_num: int) -> list[dict
 # ── Construcción del diccionario mm→dm³ ─────────────────────────────────────
 
 def build_vols(all_rows: list[dict]) -> tuple[dict[int, float], list[str]]:
-    """Devuelve (vols, warnings). Detecta y repara saltos imposibles de base_mm."""
-    warnings_list = []
+    """
+    Devuelve (vols, jump_warnings).
+    Detecta saltos imposibles de base_mm y los reporta SIN corregir,
+    para no colocar volúmenes en posiciones incorrectas.
+    """
+    jump_warnings = []
     vols = {}
     prev_base = None
 
     for row in all_rows:
         base = int(row["base_mm"])
 
-        # Detectar salto imposible: base_mm debería avanzar de a 10
         if prev_base is not None and base != prev_base + 10:
             expected = prev_base + 10
-            # Si el salto es múltiplo de 10 pero incorrecto, probablemente
-            # el número de página fue sumado al mm correcto
-            offset = base - expected
-            if offset > 0 and base > expected:
-                warnings_list.append(
-                    f"⚠️ Salto detectado: se esperaba base_mm={expected} pero se recibió {base} "
-                    f"(diferencia: {offset}). Corregido automáticamente."
-                )
-                base = expected  # reparar
+            jump_warnings.append(
+                f"Salto en base_mm: se esperaba {expected} pero el PDF entregó {base} "
+                f"(diferencia: {base - expected}). Verificar manualmente esa zona del PDF."
+            )
 
         prev_base = base
 
-        for i, v in enumerate(row["values"][:10]):  # máximo 10 valores
+        for i, v in enumerate(row["values"][:10]):
             if v is not None:
                 vols[base + i] = v
 
-    return vols, warnings_list
+    return vols, jump_warnings
 
 
 def has_decimals(vols: dict) -> bool:
@@ -207,30 +205,40 @@ def validate_vols(vols: dict) -> dict:
         "faltantes": len(missing),
     }
 
+    # Conjunto de mm problemáticos para marcar en rojo en el Excel
+    bad_mm: set[int] = set(missing)
+    bad_mm.update(mm for mm, _, _ in non_mono)
+    bad_mm.update(mm for mm, _ in outliers) if increments else None
+
     return {
         "ok": len(errors) == 0,
         "errors": errors,
         "warnings": warnings,
         "stats": stats,
+        "bad_mm": bad_mm,
     }
 
 
 # ── Generación del Excel ─────────────────────────────────────────────────────
 
-def generate_excel(vols: dict, tank_name: str, cert_number: str) -> bytes:
+def generate_excel(vols: dict, tank_name: str, cert_number: str,
+                   validation: dict, jump_warnings: list[str]) -> bytes:
+    from datetime import datetime
     wb = Workbook()
+
+    # ── Hoja principal ───────────────────────────────────────────────────────
     ws = wb.active
     ws.title = f"TK-{tank_name}"
 
     TITLE_FILL  = PatternFill("solid", start_color="0D2A4A")
     HEADER_FILL = PatternFill("solid", start_color="1F4E79")
     ALT_FILL    = PatternFill("solid", start_color="D6E4F0")
+    ERROR_FILL  = PatternFill("solid", start_color="FF4444")
     thin   = Side(style="thin", color="AAAAAA")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
     center = Alignment(horizontal="center", vertical="center")
     data_font = Font(name="Arial", size=9)
 
-    # Título
     ws.merge_cells("A1:B1")
     ws["A1"] = f"TABLA DE LLENADO — TANQUE {tank_name}  |  TAGSA"
     ws["A1"].font = Font(name="Arial", bold=True, color="FFFFFF", size=12)
@@ -238,22 +246,23 @@ def generate_excel(vols: dict, tank_name: str, cert_number: str) -> bytes:
     ws["A1"].alignment = center
     ws.row_dimensions[1].height = 22
 
-    # Info certificado
+    estado = "✅ APROBADA" if validation["ok"] else "❌ CON ERRORES — ver hoja VALIDACIÓN"
     info = [
         ("Razón Social:", "Antivari S.A."),
         ("Tanque Nº:", tank_name),
         ("Certificado INTI Nº:", cert_number),
         ("Unidad:", "dm³"),
+        ("Validación:", estado),
     ]
     for i, (lbl, val) in enumerate(info):
         r = i + 2
         c1 = ws.cell(r, 1, lbl)
         c1.font = Font(name="Arial", bold=True, size=9)
         c2 = ws.cell(r, 2, val)
-        c2.font = Font(name="Arial", size=9)
+        c2.font = Font(name="Arial", size=9,
+                       color="FF0000" if "ERRORES" in str(val) else "000000")
         ws.row_dimensions[r].height = 14
 
-    # Encabezados
     header_row = len(info) + 2
     for c, h in [(1, "mm"), (2, "dm³")]:
         cell = ws.cell(header_row, c, h)
@@ -267,31 +276,76 @@ def generate_excel(vols: dict, tank_name: str, cert_number: str) -> bytes:
     ws.freeze_panes = f"A{header_row + 1}"
 
     num_format = "#,##0.000" if has_decimals(vols) else "#,##0"
+    bad_mm = validation.get("bad_mm", set())
 
-    # Datos
     row = header_row + 1
     for mm in range(0, max(vols.keys()) + 1):
         vol = vols.get(mm)
         if vol is None:
             continue
+        is_bad = mm in bad_mm
         is_alt = (mm // 10) % 2 == 1
 
+        fill = ERROR_FILL if is_bad else (ALT_FILL if is_alt else None)
+        font_color = "FFFFFF" if is_bad else "000000"
+
         c1 = ws.cell(row, 1, mm)
-        c1.font = data_font
+        c1.font = Font(name="Arial", size=9, bold=is_bad, color=font_color)
         c1.alignment = center
         c1.border = border
-        if is_alt:
-            c1.fill = ALT_FILL
+        if fill: c1.fill = fill
 
         c2 = ws.cell(row, 2, vol)
-        c2.font = data_font
+        c2.font = Font(name="Arial", size=9, bold=is_bad, color=font_color)
         c2.alignment = center
         c2.border = border
         c2.number_format = num_format
-        if is_alt:
-            c2.fill = ALT_FILL
+        if fill: c2.fill = fill
 
         row += 1
+
+    # ── Hoja VALIDACIÓN ──────────────────────────────────────────────────────
+    wv = wb.create_sheet("VALIDACIÓN")
+    wv.column_dimensions["A"].width = 20
+    wv.column_dimensions["B"].width = 80
+
+    def val_row(r, label, value, bold=False, color="000000"):
+        c1 = wv.cell(r, 1, label)
+        c1.font = Font(name="Arial", bold=bold, size=9)
+        c2 = wv.cell(r, 2, value)
+        c2.font = Font(name="Arial", bold=bold, size=9, color=color)
+
+    r = 1
+    val_row(r, "REPORTE DE VALIDACIÓN", f"Tanque {tank_name}", bold=True); r += 1
+    val_row(r, "Fecha generación", datetime.now().strftime("%Y-%m-%d %H:%M")); r += 1
+    val_row(r, "Certificado INTI", cert_number); r += 1
+    val_row(r, "Total mm procesados", str(validation["stats"]["total_mm"])); r += 1
+    val_row(r, "Rango", validation["stats"]["rango"]); r += 1
+    val_row(r, "Volumen mín (dm³)", validation["stats"]["vol_min"]); r += 1
+    val_row(r, "Volumen máx (dm³)", validation["stats"]["vol_max"]); r += 1
+    val_row(r, "MM faltantes", str(validation["stats"]["faltantes"])); r += 1
+    r += 1
+
+    result_txt = "APROBADA" if validation["ok"] else "FALLIDA — NO USAR"
+    result_col = "008000" if validation["ok"] else "FF0000"
+    val_row(r, "RESULTADO", result_txt, bold=True, color=result_col); r += 2
+
+    if validation["errors"]:
+        val_row(r, "ERRORES", "", bold=True, color="FF0000"); r += 1
+        for e in validation["errors"]:
+            val_row(r, "", e, color="FF0000"); r += 1
+        r += 1
+
+    if validation["warnings"]:
+        val_row(r, "ADVERTENCIAS", "", bold=True, color="CC6600"); r += 1
+        for w in validation["warnings"]:
+            val_row(r, "", w, color="CC6600"); r += 1
+        r += 1
+
+    if jump_warnings:
+        val_row(r, "SALTOS DE PÁGINA", "", bold=True, color="0000CC"); r += 1
+        for w in jump_warnings:
+            val_row(r, "", w, color="0000CC"); r += 1
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -361,13 +415,12 @@ def main():
                 st.stop()
 
             st.write("Generando Excel…")
-            vols, build_warns = build_vols(all_rows)
-            for w in build_warns:
-                st.warning(w)
+            vols, jump_warns = build_vols(all_rows)
 
             st.write("Validando integridad de los datos…")
             validation = validate_vols(vols)
-            excel_bytes = generate_excel(vols, tank_name, cert_number or "—")
+            excel_bytes = generate_excel(vols, tank_name, cert_number or "—",
+                                         validation, jump_warns)
 
             status.update(label="¡Listo!", state="complete")
 
@@ -398,10 +451,10 @@ def main():
                 for w in validation["warnings"]:
                     st.warning(w)
 
-        if build_warns:
-            with st.expander("🔧 Correcciones automáticas aplicadas", expanded=False):
-                for w in build_warns:
-                    st.info(w)
+        if jump_warns:
+            with st.expander("⚠️ Saltos de página detectados (requieren verificación manual)", expanded=False):
+                for w in jump_warns:
+                    st.warning(w)
 
         st.divider()
 
