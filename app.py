@@ -470,7 +470,8 @@ def main():
             all_rows_1 = [r for _, _, rows in page_results for r in rows]
             vols, jump_warns = build_vols(all_rows_1)
             validation_1 = validate_vols(vols)
-            status1.update(label=f"Pasada 1 completa — {'✅ sin errores' if validation_1['ok'] else f'❌ {len(validation_1[\"errors\"])} error(es)'}", state="complete")
+            p1_label = "Pasada 1 completa — sin errores" if validation_1["ok"] else f"Pasada 1 completa — {len(validation_1['errors'])} error(es)"
+            status1.update(label=p1_label, state="complete")
 
         # ── PASADA 2: Sonnet (solo páginas con problemas) ────────────────────
         pages_to_retry = find_pages_to_retry(page_results, validation_1)
@@ -493,10 +494,8 @@ def main():
                 all_rows_2 = [r for _, _, rows in page_results for r in rows]
                 vols, jump_warns = build_vols(all_rows_2)
                 validation_2 = validate_vols(vols)
-                status2.update(
-                    label=f"Pasada 2 completa — {'✅ sin errores' if validation_2['ok'] else f'❌ {len(validation_2[\"errors\"])} error(es) restantes'}",
-                    state="complete"
-                )
+                p2_label = "Pasada 2 completa — sin errores" if validation_2["ok"] else f"Pasada 2 completa — {len(validation_2['errors'])} error(es) restantes"
+                status2.update(label=p2_label, state="complete")
             validation = validation_2
         else:
             validation = validation_1
