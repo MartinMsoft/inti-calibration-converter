@@ -301,13 +301,26 @@ def generate_excel(vols: dict, tank_name: str, cert_number: str,
     ws.freeze_panes = f"A{header_row + 1}"
 
     num_format = "#,##0.000" if has_decimals(vols) else "#,##0"
-    bad_mm = validation.get("bad_mm", set())
+    bad_mm    = validation.get("bad_mm", set())
+    missing_s = set(validation.get("missing", []))
+    MISSING_FILL = PatternFill("solid", start_color="FF8C00")  # naranja
 
     row = header_row + 1
     for mm in range(0, max(vols.keys()) + 1):
         vol = vols.get(mm)
+
         if vol is None:
+            # Fila faltante — siempre visible en el Excel
+            c1 = ws.cell(row, 1, mm)
+            c1.font = Font(name="Arial", size=9, bold=True, color="FFFFFF")
+            c1.alignment = center; c1.border = border; c1.fill = MISSING_FILL
+
+            c2 = ws.cell(row, 2, "FALTANTE")
+            c2.font = Font(name="Arial", size=9, bold=True, color="FFFFFF")
+            c2.alignment = center; c2.border = border; c2.fill = MISSING_FILL
+            row += 1
             continue
+
         is_bad = mm in bad_mm
         is_alt = (mm // 10) % 2 == 1
         fill = ERROR_FILL if is_bad else (ALT_FILL if is_alt else None)
