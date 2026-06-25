@@ -15,7 +15,7 @@ MODEL_PRECISE = "claude-sonnet-4-6"
 # ── Helpers de imagen ────────────────────────────────────────────────────────
 
 def pdf_to_images(pdf_bytes: bytes):
-    return convert_from_bytes(pdf_bytes, dpi=300)
+    return convert_from_bytes(pdf_bytes, dpi=150)
 
 def image_to_base64(image) -> str:
     buf = io.BytesIO()
