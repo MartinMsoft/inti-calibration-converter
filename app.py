@@ -11,7 +11,8 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
 MODEL_FAST    = "claude-haiku-4-5-20251001"
 MODEL_PRECISE = "claude-sonnet-4-6"
-BATCH_SIZE    = 5   # paginas por llamada API (contexto cruzado entre paginas)
+BATCH_SIZE    = 3   # paginas por llamada (contexto cruzado sin exceder max_tokens)
+MAX_TOKENS    = 8192  # suficiente para ~3 paginas de tabla
 
 # ── Helpers de imagen ────────────────────────────────────────────────────────
 
@@ -95,7 +96,7 @@ def extract_batch(client: anthropic.Anthropic, batch: list,
     try:
         response = client.messages.create(
             model=model,
-            max_tokens=4096,
+            max_tokens=MAX_TOKENS,
             messages=[{"role": "user", "content": content}],
         )
         raw = response.content[0].text.strip()
