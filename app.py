@@ -101,6 +101,11 @@ def extract_batch(client: anthropic.Anthropic, batch: list,
         raw = response.content[0].text.strip()
         raw = re.sub(r"^```[a-z]*\n?", "", raw)
         raw = re.sub(r"\n?```$", "", raw)
+        # Si Claude agrego texto antes del JSON, buscar el inicio del objeto
+        if not raw.startswith("{"):
+            idx = raw.find("{")
+            if idx != -1:
+                raw = raw[idx:]
         data = json.loads(raw)
         return data.get("rows", [])
     except Exception as e:
@@ -526,12 +531,13 @@ def main():
                     retry_prompt = make_retry_prompt(exp_start, exp_end)
                     new_rows = extract_batch(client, batch, model=MODEL_PRECISE,
                                             prompt=retry_prompt)
-                    # Reemplazar en batch_results
+                    # Solo reemplazar si Sonnet devolvio datos (nunca descartar datos de Haiku)
+                    keep_rows = new_rows if new_rows else old_rows
                     for i, (bi, bt, _) in enumerate(batch_results):
                         if bi == b_idx:
-                            batch_results[i] = (bi, bt, new_rows)
+                            batch_results[i] = (bi, bt, keep_rows)
                             break
-                    st.write(f"  -> {len(new_rows)} filas extraidas (antes: {len(old_rows)}).")
+                    st.write(f"  -> {len(new_rows)} filas de Sonnet (antes Haiku: {len(old_rows)}). Usando: {len(keep_rows)}.")
 
                 all_rows_p2 = []
                 for _, _, rows in batch_results:
