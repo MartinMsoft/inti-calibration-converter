@@ -104,8 +104,18 @@ div[data-testid="stMetric"] {
     border-radius: 8px;
     padding: 10px 12px;
     box-shadow: 0 0 14px rgba(0,229,255,0.08);
+    overflow: visible;
 }
-div[data-testid="stMetricValue"] { color: #00e5ff !important; }
+div[data-testid="stMetricValue"] {
+    color: #00e5ff !important;
+    font-size: 1.35rem !important;
+    white-space: normal !important;
+    overflow: visible !important;
+    text-overflow: clip !important;
+    overflow-wrap: anywhere;
+    line-height: 1.25;
+}
+div[data-testid="stMetricLabel"] { font-size: 0.85rem !important; }
 
 div[data-testid="stExpander"], div[data-testid="stStatusWidget"] {
     border: 1px solid rgba(0,229,255,0.25) !important;
