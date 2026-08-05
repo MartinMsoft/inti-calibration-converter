@@ -14,7 +14,14 @@ from extraction import (
     pdf_to_images,
     run_extractions,
 )
-from validation import build_vols, find_pages_to_retry, fix_scale_errors, get_prev_context, validate_vols
+from validation import (
+    build_vols,
+    find_pages_to_retry,
+    fix_scale_errors,
+    fix_scale_shift_runs,
+    get_prev_context,
+    validate_vols,
+)
 
 logger = logging.getLogger("inti_converter")
 logger.setLevel(logging.INFO)
@@ -187,8 +194,10 @@ def main():
                 if not vols:
                     st.error("No se extrajeron datos en la pasada 1. Revisa el PDF.")
                     st.stop()
-                vols, sf1 = fix_scale_errors(vols)
-                if sf1: st.info(f"Escala corregida en {len(sf1)} valores.")
+                vols, sf1a = fix_scale_errors(vols)
+                vols, sf1b = fix_scale_shift_runs(vols)
+                sf1 = sf1a + sf1b
+                if sf1: st.info(f"Escala corregida en {len(sf1)} tramo(s)/valor(es).")
                 validation_1 = validate_vols(vols)
                 p1_lbl = "Pasada 1 completa - sin errores" if validation_1["ok"] else f"Pasada 1: {len(validation_1['errors'])} error(es)"
                 status1.update(label=p1_lbl, state="complete")
@@ -226,8 +235,10 @@ def main():
                     if not vols:
                         st.error("No se pudieron extraer datos. Revisa el PDF.")
                         st.stop()
-                    vols, sf2 = fix_scale_errors(vols)
-                    if sf2: st.info(f"Escala corregida en {len(sf2)} valores.")
+                    vols, sf2a = fix_scale_errors(vols)
+                    vols, sf2b = fix_scale_shift_runs(vols)
+                    sf2 = sf2a + sf2b
+                    if sf2: st.info(f"Escala corregida en {len(sf2)} tramo(s)/valor(es).")
                     validation_2 = validate_vols(vols)
                     p2_lbl = "Pasada 2 completa - sin errores" if validation_2["ok"] else f"Pasada 2: {len(validation_2['errors'])} error(es) restantes"
                     status2.update(label=p2_lbl, state="complete")

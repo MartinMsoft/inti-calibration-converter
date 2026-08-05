@@ -54,6 +54,102 @@ def fix_scale_errors(vols: dict) -> tuple[dict[int, float], list[str]]:
     return corrected, fixes
 
 
+# ── Correccion de corrimientos de escala sostenidos ──────────────────────────
+
+
+def fix_scale_shift_runs(vols: dict, window: int = 20,
+                          accept_tolerance: float = 4.0) -> tuple[dict[int, float], list[str]]:
+    """
+    fix_scale_errors detecta errores de escala AISLADOS (un solo mm fuera de
+    lugar entre vecinos correctos). Pero si una pagina entera se lee mal, el
+    salto de escala solo se nota en el primer punto: todos los valores
+    siguientes quedan igual de mal, pero *consistentes entre si*, y ese tipo
+    de corrimiento sostenido pasa desapercibido para las comparaciones
+    puntuales.
+
+    Esta funcion mantiene una ventana movil de incrementos "confirmados
+    buenos" y, cuando un incremento se dispara ~1000x (o ~1/1000x) respecto
+    de esa tendencia, prueba si corrigiendo /1000 (o x1000) el incremento
+    vuelve a un rango normal. Si es asi, sigue aplicando la misma correccion
+    a los mm siguientes mientras se mantengan consistentes, hasta que la
+    racha termina (el valor corregido deja de tener sentido) o se acaban los
+    datos.
+    """
+    mm_sorted = sorted(vols.keys())
+    corrected = dict(vols)
+    fixes: list[str] = []
+    good_increments: list[float] = []
+    factor: Optional[float] = None
+    run_start: Optional[int] = None
+
+    def median(values: list[float]) -> float:
+        s = sorted(values)
+        return s[len(s) // 2]
+
+    def close_to_trend(inc: float, med: float) -> bool:
+        return med > 0 and inc > 0 and (1 / accept_tolerance) <= (inc / med) <= accept_tolerance
+
+    def close_window(values: list[float]) -> list[float]:
+        return values[-window:]
+
+    for i in range(1, len(mm_sorted)):
+        mm, mm_prev = mm_sorted[i], mm_sorted[i - 1]
+        if mm != mm_prev + 1:
+            factor = None  # hueco en la serie: no se puede comparar, cortar racha
+            continue
+
+        if factor is not None:
+            candidate = corrected[mm] / factor
+            med = median(good_increments) if good_increments else 0.0
+            if close_to_trend(candidate - corrected[mm_prev], med):
+                corrected[mm] = candidate
+                good_increments = close_window(good_increments + [candidate - corrected[mm_prev]])
+                continue
+            fixes.append(
+                f"mm={run_start}-{mm_prev}: corregido {'/1000' if factor == 1000 else 'x1000'} "
+                f"({mm_prev - run_start + 1} valor(es), corrimiento de escala sostenido)"
+            )
+            factor = None
+
+        raw_inc = corrected[mm] - corrected[mm_prev]
+        med = median(good_increments) if len(good_increments) >= 5 else 0.0
+
+        if med > 0 and not close_to_trend(raw_inc, med):
+            # El punto no encaja con la tendencia reciente (puede ser un
+            # incremento gigante -> /1000, o incluso negativo si el valor
+            # corrupto quedo muy por debajo del anterior -> x1000).
+            candidate_div = corrected[mm] / 1000.0
+            candidate_mul = corrected[mm] * 1000.0
+            if close_to_trend(candidate_div - corrected[mm_prev], med):
+                corrected[mm] = candidate_div
+                factor = 1000.0
+                run_start = mm
+                good_increments = close_window(good_increments + [candidate_div - corrected[mm_prev]])
+                continue
+            if close_to_trend(candidate_mul - corrected[mm_prev], med):
+                corrected[mm] = candidate_mul
+                factor = 1 / 1000.0
+                run_start = mm
+                good_increments = close_window(good_increments + [candidate_mul - corrected[mm_prev]])
+                continue
+            # Anomalia real pero no un simple factor de 1000: no la tocamos
+            # (queda para que validate_vols la reporte) y no contaminamos la
+            # ventana de tendencia con este punto.
+            continue
+
+        if raw_inc > 0:
+            good_increments = close_window(good_increments + [raw_inc])
+
+    if factor is not None:
+        fixes.append(
+            f"mm={run_start}-{mm_sorted[-1]}: corregido {'/1000' if factor == 1000 else 'x1000'} "
+            f"({mm_sorted[-1] - run_start + 1} valor(es), corrimiento de escala sostenido "
+            f"hasta el final de los datos)"
+        )
+
+    return corrected, fixes
+
+
 # ── Validacion ────────────────────────────────────────────────────────────────
 
 
