@@ -19,6 +19,7 @@ MAX_WORKERS = 5
 MAX_RETRIES = 3
 RETRY_BASE_DELAY = 1.5
 DEFAULT_DPI = 150
+MAX_TOKENS = 8192
 
 # ── Helpers de PDF/imagen ─────────────────────────────────────────────────────
 
@@ -96,7 +97,7 @@ Los valores de esta pagina deben ser mayores en la misma escala."""
 def _call_claude(client: anthropic.Anthropic, image_b64: str, model: str, prompt: str) -> list[dict]:
     response = client.messages.create(
         model=model,
-        max_tokens=4096,
+        max_tokens=MAX_TOKENS,
         messages=[{
             "role": "user",
             "content": [
