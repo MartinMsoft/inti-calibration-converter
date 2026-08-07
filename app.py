@@ -241,10 +241,24 @@ def main():
                     for page_num in sorted(pages_to_retry):
                         _pn, old_rows = page_results[page_num - 1]
                         bases = [int(r["base_mm"]) for r in old_rows] if old_rows else []
-                        exp_start = min(bases) if bases else 0
-                        exp_end = max(bases) + 9 if bases else 9999
-                        ctx = get_prev_context(vols, exp_start)
+                        naive_start = min(bases) if bases else 0
+                        row_span = (max(bases) + 10 - min(bases)) if bases else 100
+
+                        # Ojo: no confiar en "bases" para el rango esperado, porque
+                        # si la Pasada 1 le puso una etiqueta de fila equivocada a
+                        # TODA la pagina (lo vimos pasar: +100 de corrimiento), usar
+                        # esas bases como "rango esperado" solo refuerza el mismo
+                        # error en el reintento. Mejor anclar el inicio en la
+                        # continuidad real (donde termino la pagina anterior).
+                        ctx = get_prev_context(vols, naive_start)
                         prev_m, prev_v = ctx if ctx else (None, None)
+                        if prev_m is not None:
+                            exp_start = ((prev_m + 1 + 9) // 10) * 10
+                        else:
+                            exp_start = naive_start
+                        exp_end = exp_start + row_span - 1 + 100  # margen generoso: la pagina
+                        # puede tener mas filas de las que la Pasada 1 llego a detectar
+
                         retry_prompt = make_retry_prompt(exp_start, exp_end, prev_m, prev_v)
                         retry_jobs.append((page_num, pdf_bytes, retry_prompt, MODEL_PRECISE))
 

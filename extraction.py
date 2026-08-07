@@ -81,13 +81,24 @@ def make_retry_prompt(expected_start: int, expected_end: int,
                        prev_mm: Optional[int] = None, prev_vol: Optional[float] = None) -> str:
     prompt = BASE_PROMPT + f"""
 
-ATENCION ESPECIAL:
-Esta pagina debe contener datos para mm aproximadamente {expected_start} a {expected_end}.
-Revisa cada digito con maxima precision. Es una calibracion industrial critica."""
+ATENCION ESPECIAL - esta pagina se esta re-procesando porque la lectura anterior
+tuvo un error de validacion (faltan valores, o la secuencia no es consistente):
+Se espera que esta pagina cubra APROXIMADAMENTE mm {expected_start} a {expected_end},
+pero ese rango es una ESTIMACION basada en la pagina anterior, no una certeza.
+
+NO ASUMAS que la lectura anterior conto bien las filas ni les puso la etiqueta
+"mm" correcta en la primera columna. Volve a contar CADA fila de la imagen desde
+cero, columna por columna, y anota el numero exacto que esta impreso en la
+columna "mm" de cada fila (no lo deduzcas por continuidad). Es comun que una
+pagina tenga MAS filas de las detectadas antes, o que la primera columna se
+haya leido con un digito equivocado. Revisa cada digito con maxima precision:
+es una calibracion industrial critica."""
     if prev_mm is not None:
         prompt += f"""
-El valor anterior confirmado fue mm={prev_mm}, volumen={prev_vol:.0f} dm3.
-Los valores de esta pagina deben ser mayores en la misma escala."""
+
+El ultimo valor CONFIRMADO de la pagina anterior fue mm={prev_mm}, volumen={prev_vol:.0f} dm3.
+La primera fila de esta pagina deberia continuar inmediatamente despues de ese mm
+(en pasos de 10), y los volumenes deben ser mayores y en la misma escala."""
     return prompt
 
 
