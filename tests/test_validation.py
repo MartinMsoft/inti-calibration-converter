@@ -8,6 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from validation import (
     build_vols,
     find_pages_to_retry,
+    fix_row_scale_consistency,
     fix_scale_errors,
     fix_scale_shift_runs,
     get_prev_context,
@@ -21,8 +22,8 @@ def make_row(base, values):
 
 def test_build_vols_basic():
     page_results = [
-        (1, None, [make_row(0, list(range(0, 10)))]),
-        (2, None, [make_row(10, [10, 11, None, 13, 14, 15, 16, 17, 18, 19])]),
+        (1, [make_row(0, list(range(0, 10)))]),
+        (2, [make_row(10, [10, 11, None, 13, 14, 15, 16, 17, 18, 19])]),
     ]
     vols = build_vols(page_results)
     assert vols[0] == 0
@@ -91,14 +92,14 @@ def test_validate_vols_empty():
 
 def test_find_pages_to_retry_flags_empty_pages():
     validation = {"bad_mm": set(), "missing": []}
-    page_results = [(1, None, []), (2, None, [make_row(0, [0] * 10)])]
+    page_results = [(1, []), (2, [make_row(0, [0] * 10)])]
     retry = find_pages_to_retry(page_results, validation)
     assert retry == {1}
 
 
 def test_find_pages_to_retry_flags_pages_with_bad_mm():
     validation = {"bad_mm": {15}, "missing": []}
-    page_results = [(1, None, [make_row(10, [10 + i for i in range(10)])])]
+    page_results = [(1, [make_row(10, [10 + i for i in range(10)])])]
     retry = find_pages_to_retry(page_results, validation)
     assert retry == {1}
 
@@ -170,4 +171,33 @@ def test_fix_scale_shift_runs_ignores_legitimate_large_jump():
     vols = {**good, **bigger_but_not_1000x}
     corrected, fixes = fix_scale_shift_runs(vols)
     assert corrected == vols
+    assert fixes == []
+
+
+def test_fix_row_scale_consistency_real_case_mixed_row():
+    # Caso real reportado: dentro de UNA fila, la IA leyo v0 como decimal
+    # (867.774) y v1..v9 como enteros x1000 (867677, 867980, ...).
+    row = make_row(8310, [
+        867.774, 867677.0, 867980.0, 868083.0, 868186.0,
+        868290.0, 868393.0, 868496.0, 868599.0, 868702.0,
+    ])
+    fixed_rows, fixes = fix_row_scale_consistency([row])
+    values = fixed_rows[0]["values"]
+    assert values[0] == pytest.approx(867.774, abs=0.001)
+    assert values[1] == pytest.approx(867.677, abs=0.001)
+    assert values[9] == pytest.approx(868.702, abs=0.001)
+    assert len(fixes) == 9
+
+
+def test_fix_row_scale_consistency_noop_on_clean_row():
+    row = make_row(0, [0.0, 0.103, 0.206, 0.309, 0.412, 0.515, 0.618, 0.721, 0.824, 0.927])
+    fixed_rows, fixes = fix_row_scale_consistency([row])
+    assert fixed_rows[0]["values"] == row["values"]
+    assert fixes == []
+
+
+def test_fix_row_scale_consistency_ignores_rows_with_too_few_points():
+    row = make_row(0, [1.0, 2.0, None, None, None, None, None, None, None, None])
+    fixed_rows, fixes = fix_row_scale_consistency([row])
+    assert fixed_rows[0]["values"] == row["values"]
     assert fixes == []

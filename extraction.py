@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Optional
 
 import anthropic
-from pdf2image import convert_from_bytes
+from pdf2image import convert_from_bytes, pdfinfo_from_bytes
 
 logger = logging.getLogger("inti_converter")
 
@@ -18,12 +18,24 @@ MODEL_PRECISE = "claude-sonnet-4-6"
 MAX_WORKERS = 5
 MAX_RETRIES = 3
 RETRY_BASE_DELAY = 1.5
+DEFAULT_DPI = 150
 
-# ── Helpers de imagen ────────────────────────────────────────────────────────
+# ── Helpers de PDF/imagen ─────────────────────────────────────────────────────
 
 
-def pdf_to_images(pdf_bytes: bytes):
-    return convert_from_bytes(pdf_bytes, dpi=150)
+def get_pdf_page_count(pdf_bytes: bytes) -> int:
+    info = pdfinfo_from_bytes(pdf_bytes)
+    return int(info["Pages"])
+
+
+def render_pdf_page(pdf_bytes: bytes, page_num: int, dpi: int = DEFAULT_DPI):
+    """Renderiza UNA sola pagina del PDF por vez. Convertir el documento
+    entero de una sola vez (30+ paginas) mantiene todas las imagenes
+    decodificadas en memoria al mismo tiempo, lo cual hace crashear la app
+    por falta de RAM en el plan free de Render. Renderizando bajo demanda,
+    solo hay como maximo MAX_WORKERS imagenes en memoria en un momento dado."""
+    pages = convert_from_bytes(pdf_bytes, dpi=dpi, first_page=page_num, last_page=page_num)
+    return pages[0]
 
 
 def image_to_base64(image) -> str:
@@ -107,9 +119,9 @@ def _call_claude(client: anthropic.Anthropic, image_b64: str, model: str, prompt
 
 def extract_page(client: anthropic.Anthropic, image, page_num: int,
                   model: str = MODEL_FAST, prompt: Optional[str] = None) -> list[dict]:
-    """Extrae una pagina. Reintenta con backoff ante errores transitorios
-    (red, rate-limit, JSON malformado); tras agotar los intentos devuelve
-    lista vacia y deja constancia en el log."""
+    """Extrae una pagina ya renderizada. Reintenta con backoff ante errores
+    transitorios (red, rate-limit, JSON malformado); tras agotar los
+    intentos devuelve lista vacia y deja constancia en el log."""
     prompt = prompt or BASE_PROMPT
     image_b64 = image_to_base64(image)
     last_err: Optional[Exception] = None
@@ -125,21 +137,37 @@ def extract_page(client: anthropic.Anthropic, image, page_num: int,
     return []
 
 
+def extract_pdf_page(client: anthropic.Anthropic, pdf_bytes: bytes, page_num: int,
+                      model: str = MODEL_FAST, prompt: Optional[str] = None,
+                      dpi: int = DEFAULT_DPI) -> list[dict]:
+    """Renderiza la pagina bajo demanda dentro del hilo de trabajo y la
+    descarta apenas termina de usarla (no la retiene en memoria)."""
+    image = render_pdf_page(pdf_bytes, page_num, dpi)
+    try:
+        return extract_page(client, image, page_num, model, prompt)
+    finally:
+        del image
+
+
 # ── Ejecucion concurrente ─────────────────────────────────────────────────────
 
-ExtractJob = tuple[int, object, str, str]  # (page_num, image, prompt, model)
+ExtractJob = tuple[int, bytes, str, str]  # (page_num, pdf_bytes, prompt, model)
 
 
 def run_extractions(client: anthropic.Anthropic, jobs: list[ExtractJob],
                      on_done: Optional[Callable[[int, list[dict]], None]] = None) -> dict[int, list[dict]]:
-    """Corre extract_page para cada job en paralelo (hasta MAX_WORKERS a la vez).
+    """Corre extract_pdf_page para cada job en paralelo (hasta MAX_WORKERS a
+    la vez). Cada worker renderiza su propia pagina bajo demanda, asi que en
+    ningun momento hay mas de MAX_WORKERS imagenes decodificadas a la vez,
+    sin importar cuantas paginas tenga el PDF.
     on_done(page_num, rows) se llama desde el hilo principal a medida que
-    cada pagina termina, en el orden en que van completando (no el orden de la lista)."""
+    cada pagina termina, en el orden en que van completando (no el orden de
+    la lista)."""
     results: dict[int, list[dict]] = {}
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         futures = {
-            pool.submit(extract_page, client, img, page_num, model, prompt): page_num
-            for page_num, img, prompt, model in jobs
+            pool.submit(extract_pdf_page, client, pdf_bytes, page_num, model, prompt): page_num
+            for page_num, pdf_bytes, prompt, model in jobs
         }
         for future in as_completed(futures):
             page_num = futures[future]

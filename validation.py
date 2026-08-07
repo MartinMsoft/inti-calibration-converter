@@ -4,15 +4,72 @@ from typing import Optional
 
 
 def build_vols(page_results: list) -> dict[int, float]:
-    """Convierte la lista de (page_num, img, rows) en el diccionario mm->vol."""
+    """Convierte la lista de (page_num, rows) en el diccionario mm->vol."""
     vols = {}
-    for _pn, _img, rows in page_results:
+    for _pn, rows in page_results:
         for row in rows:
             base = int(row["base_mm"])
             for i, v in enumerate(row["values"][:10]):
                 if v is not None:
                     vols[base + i] = v
     return vols
+
+
+# ── Consistencia interna de fila ──────────────────────────────────────────────
+
+
+def fix_row_scale_consistency(rows: list[dict], tolerance: float = 4.0) -> tuple[list[dict], list[str]]:
+    """
+    Los 10 valores de una misma fila (mismo base_mm) salen de la MISMA
+    lectura de la IA y deberian ser monotonos crecientes con incrementos
+    parecidos entre si. Si la IA interpreto un par "punto=decimal vs
+    punto=miles" de forma inconsistente DENTRO de la fila (ej: v0 leido como
+    decimal y v1..v9 leidos como enteros x1000), fix_scale_errors y
+    fix_scale_shift_runs no lo detectan porque comparan contra la tendencia
+    de OTRAS paginas, que puede estar igual de "contaminada". Esta funcion
+    usa solo el contexto de la propia fila (misma llamada, maxima confianza)
+    para detectar y corregir esos saltos.
+    """
+    fixed_rows = []
+    fixes: list[str] = []
+
+    for row in rows:
+        base = row["base_mm"]
+        values = list(row["values"])
+
+        incs = [values[i] - values[i - 1] for i in range(1, len(values))
+                if values[i] is not None and values[i - 1] is not None
+                and values[i] - values[i - 1] > 0]
+        if len(incs) < 3:
+            fixed_rows.append({"base_mm": base, "values": values})
+            continue
+        incs_sorted = sorted(incs)
+        med = incs_sorted[len(incs_sorted) // 2]
+        if med <= 0:
+            fixed_rows.append({"base_mm": base, "values": values})
+            continue
+
+        def close_enough(inc: float) -> bool:
+            return abs(inc) <= med * tolerance
+
+        for i in range(1, len(values)):
+            prev_v, cur_v = values[i - 1], values[i]
+            if prev_v is None or cur_v is None:
+                continue
+            if close_enough(cur_v - prev_v):
+                continue
+            for factor, label in ((1 / 1000.0, "/1000"), (1000.0, "x1000")):
+                candidate = cur_v * factor
+                if close_enough(candidate - prev_v):
+                    fixes.append(
+                        f"mm={base + i}: {cur_v} -> {candidate} ({label}, consistencia de fila)"
+                    )
+                    values[i] = candidate
+                    break
+
+        fixed_rows.append({"base_mm": base, "values": values})
+
+    return fixed_rows, fixes
 
 
 # ── Correccion de escala ──────────────────────────────────────────────────────
@@ -238,7 +295,7 @@ def find_pages_to_retry(page_results: list, validation: dict) -> set[int]:
     missing_s = set(validation["missing"])
     retry = set()
 
-    for page_num, _img, rows in page_results:
+    for page_num, rows in page_results:
         if not rows:
             retry.add(page_num); continue
         for row in rows:
@@ -248,7 +305,7 @@ def find_pages_to_retry(page_results: list, validation: dict) -> set[int]:
 
     if missing_s:
         min_m, max_m = min(missing_s), max(missing_s)
-        for page_num, _img, rows in page_results:
+        for page_num, rows in page_results:
             if not rows: continue
             bases = [int(r["base_mm"]) for r in rows]
             if max(bases) + 9 >= min_m - 20 and min(bases) <= max_m + 20:

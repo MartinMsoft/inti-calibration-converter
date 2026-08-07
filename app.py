@@ -10,13 +10,14 @@ from extraction import (
     MODEL_FAST,
     MODEL_PRECISE,
     ExtractJob,
+    get_pdf_page_count,
     make_retry_prompt,
-    pdf_to_images,
     run_extractions,
 )
 from validation import (
     build_vols,
     find_pages_to_retry,
+    fix_row_scale_consistency,
     fix_scale_errors,
     fix_scale_shift_runs,
     get_prev_context,
@@ -141,6 +142,19 @@ class ListLogHandler(logging.Handler):
         self.records.append(self.format(record))
 
 
+def apply_row_consistency(page_results: list) -> tuple[list, list[str]]:
+    """Corrige la consistencia interna de cada fila (ver fix_row_scale_consistency)
+    para todas las paginas, y devuelve el page_results corregido junto con el
+    log de correcciones aplicadas."""
+    fixed = []
+    fixes: list[str] = []
+    for page_num, rows in page_results:
+        fixed_rows, row_fixes = fix_row_scale_consistency(rows)
+        fixes.extend(row_fixes)
+        fixed.append((page_num, fixed_rows))
+    return fixed, fixes
+
+
 def get_api_key() -> str:
     try:
         key = st.secrets["ANTHROPIC_API_KEY"]
@@ -179,11 +193,12 @@ def main():
         logger.addHandler(log_handler)
 
         try:
+            pdf_bytes = uploaded.read()
+
             # ── PASADA 1: Haiku, todas las paginas en paralelo ────────────────
             with st.status("Pasada 1 - lectura rapida (Haiku)...", expanded=True) as status1:
-                st.write("Convirtiendo PDF a imagenes...")
-                images = pdf_to_images(uploaded.read())
-                st.write(f"PDF tiene {len(images)} pagina(s).")
+                page_count = get_pdf_page_count(pdf_bytes)
+                st.write(f"PDF tiene {page_count} pagina(s).")
 
                 progress = st.progress(0.0)
                 done_count = 0
@@ -191,14 +206,16 @@ def main():
                 def on_page_done(page_num: int, rows: list[dict]) -> None:
                     nonlocal done_count
                     done_count += 1
-                    progress.progress(done_count / len(images))
+                    progress.progress(done_count / page_count)
                     st.write(f"Pagina {page_num}: {len(rows)} filas extraidas.")
 
                 jobs: list[ExtractJob] = [
-                    (i, img, BASE_PROMPT, MODEL_FAST) for i, img in enumerate(images, 1)
+                    (i, pdf_bytes, BASE_PROMPT, MODEL_FAST) for i in range(1, page_count + 1)
                 ]
                 results1 = run_extractions(client, jobs, on_done=on_page_done)
-                page_results = [(i, images[i - 1], results1[i]) for i in range(1, len(images) + 1)]
+                page_results = [(i, results1[i]) for i in range(1, page_count + 1)]
+                page_results, row_fixes1 = apply_row_consistency(page_results)
+                if row_fixes1: st.info(f"Consistencia interna de fila corregida en {len(row_fixes1)} valor(es).")
 
                 vols = build_vols(page_results)
                 if not vols:
@@ -206,8 +223,8 @@ def main():
                     st.stop()
                 vols, sf1a = fix_scale_errors(vols)
                 vols, sf1b = fix_scale_shift_runs(vols)
-                sf1 = sf1a + sf1b
-                if sf1: st.info(f"Escala corregida en {len(sf1)} tramo(s)/valor(es).")
+                sf1 = row_fixes1 + sf1a + sf1b
+                if sf1a or sf1b: st.info(f"Escala corregida en {len(sf1a) + len(sf1b)} tramo(s)/valor(es).")
                 validation_1 = validate_vols(vols)
                 p1_lbl = "Pasada 1 completa - sin errores" if validation_1["ok"] else f"Pasada 1: {len(validation_1['errors'])} error(es)"
                 status1.update(label=p1_lbl, state="complete")
@@ -222,24 +239,27 @@ def main():
                                 expanded=True) as status2:
                     retry_jobs: list[ExtractJob] = []
                     for page_num in sorted(pages_to_retry):
-                        _pn, img, old_rows = page_results[page_num - 1]
+                        _pn, old_rows = page_results[page_num - 1]
                         bases = [int(r["base_mm"]) for r in old_rows] if old_rows else []
                         exp_start = min(bases) if bases else 0
                         exp_end = max(bases) + 9 if bases else 9999
                         ctx = get_prev_context(vols, exp_start)
                         prev_m, prev_v = ctx if ctx else (None, None)
                         retry_prompt = make_retry_prompt(exp_start, exp_end, prev_m, prev_v)
-                        retry_jobs.append((page_num, img, retry_prompt, MODEL_PRECISE))
+                        retry_jobs.append((page_num, pdf_bytes, retry_prompt, MODEL_PRECISE))
 
                     def on_retry_done(page_num: int, new_rows: list[dict]) -> None:
-                        old_rows = page_results[page_num - 1][2]
+                        old_rows = page_results[page_num - 1][1]
                         st.write(f"Pagina {page_num}: {len(new_rows)} filas Sonnet (Haiku tenia: {len(old_rows)}).")
 
                     results2 = run_extractions(client, retry_jobs, on_done=on_retry_done)
                     for page_num, new_rows in results2.items():
-                        _pn, img, old_rows = page_results[page_num - 1]
+                        _pn, old_rows = page_results[page_num - 1]
                         keep_rows = new_rows if new_rows else old_rows
-                        page_results[page_num - 1] = (page_num, img, keep_rows)
+                        page_results[page_num - 1] = (page_num, keep_rows)
+
+                    page_results, row_fixes2 = apply_row_consistency(page_results)
+                    if row_fixes2: st.info(f"Consistencia interna de fila corregida en {len(row_fixes2)} valor(es).")
 
                     vols = build_vols(page_results)
                     if not vols:
@@ -247,8 +267,8 @@ def main():
                         st.stop()
                     vols, sf2a = fix_scale_errors(vols)
                     vols, sf2b = fix_scale_shift_runs(vols)
-                    sf2 = sf2a + sf2b
-                    if sf2: st.info(f"Escala corregida en {len(sf2)} tramo(s)/valor(es).")
+                    sf2 = row_fixes2 + sf2a + sf2b
+                    if sf2a or sf2b: st.info(f"Escala corregida en {len(sf2a) + len(sf2b)} tramo(s)/valor(es).")
                     validation_2 = validate_vols(vols)
                     p2_lbl = "Pasada 2 completa - sin errores" if validation_2["ok"] else f"Pasada 2: {len(validation_2['errors'])} error(es) restantes"
                     status2.update(label=p2_lbl, state="complete")
