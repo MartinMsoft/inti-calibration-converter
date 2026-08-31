@@ -9,8 +9,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py extraction.py validation.py excel_export.py ./
-COPY .streamlit/ .streamlit/
+COPY . .
 
 EXPOSE 8501
 
