@@ -17,7 +17,7 @@ from validation import (
 
 
 def make_row(base, values):
-    return {"base_mm": base, "values": values}
+    return {"pos": base, "values": values}
 
 
 def test_build_vols_basic():
@@ -201,3 +201,34 @@ def test_fix_row_scale_consistency_ignores_rows_with_too_few_points():
     fixed_rows, fixes = fix_row_scale_consistency([row])
     assert fixed_rows[0]["values"] == row["values"]
     assert fixes == []
+
+
+# ── Formato de 1 valor por fila (ej: Winter Service, cm/litros) ──────────────
+
+
+def test_build_vols_single_value_rows():
+    page_results = [
+        (1, [make_row(0, [23.240]), make_row(1, [24.263]), make_row(2, [25.286])]),
+        (2, [make_row(3, [26.310])]),
+    ]
+    vols = build_vols(page_results)
+    assert vols == {0: 23.240, 1: 24.263, 2: 25.286, 3: 26.310}
+
+
+def test_find_pages_to_retry_flags_empty_pages_single_value_rows():
+    validation = {"bad_mm": set(), "missing": []}
+    page_results = [(1, []), (2, [make_row(0, [23.240])])]
+    retry = find_pages_to_retry(page_results, validation)
+    assert retry == {1}
+
+
+def test_find_pages_to_retry_missing_range_single_value_rows():
+    # Una pagina de 1 valor por fila (cm 0-49) seguida de otra (cm 50-99);
+    # si faltan cm en el medio, ambas paginas deben marcarse para reintento.
+    validation = {"bad_mm": set(), "missing": list(range(30, 40))}
+    page_results = [
+        (1, [make_row(cm, [float(cm)]) for cm in range(0, 50)]),
+        (2, [make_row(cm, [float(cm)]) for cm in range(50, 100)]),
+    ]
+    retry = find_pages_to_retry(page_results, validation)
+    assert 1 in retry

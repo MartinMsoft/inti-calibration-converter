@@ -4,12 +4,14 @@ from typing import Optional
 
 
 def build_vols(page_results: list) -> dict[int, float]:
-    """Convierte la lista de (page_num, rows) en el diccionario mm->vol."""
+    """Convierte la lista de (page_num, rows) en el diccionario pos->vol.
+    No asume una cantidad fija de valores por fila: sirve tanto para
+    formatos de 10 valores por fila (INTI) como de 1 (Winter Service)."""
     vols = {}
     for _pn, rows in page_results:
         for row in rows:
-            base = int(row["base_mm"])
-            for i, v in enumerate(row["values"][:10]):
+            base = int(row["pos"])
+            for i, v in enumerate(row["values"]):
                 if v is not None:
                     vols[base + i] = v
     return vols
@@ -34,19 +36,19 @@ def fix_row_scale_consistency(rows: list[dict], tolerance: float = 4.0) -> tuple
     fixes: list[str] = []
 
     for row in rows:
-        base = row["base_mm"]
+        base = row["pos"]
         values = list(row["values"])
 
         incs = [values[i] - values[i - 1] for i in range(1, len(values))
                 if values[i] is not None and values[i - 1] is not None
                 and values[i] - values[i - 1] > 0]
         if len(incs) < 3:
-            fixed_rows.append({"base_mm": base, "values": values})
+            fixed_rows.append({"pos": base, "values": values})
             continue
         incs_sorted = sorted(incs)
         med = incs_sorted[len(incs_sorted) // 2]
         if med <= 0:
-            fixed_rows.append({"base_mm": base, "values": values})
+            fixed_rows.append({"pos": base, "values": values})
             continue
 
         def close_enough(inc: float) -> bool:
@@ -62,12 +64,12 @@ def fix_row_scale_consistency(rows: list[dict], tolerance: float = 4.0) -> tuple
                 candidate = cur_v * factor
                 if close_enough(candidate - prev_v):
                     fixes.append(
-                        f"mm={base + i}: {cur_v} -> {candidate} ({label}, consistencia de fila)"
+                        f"pos={base + i}: {cur_v} -> {candidate} ({label}, consistencia de fila)"
                     )
                     values[i] = candidate
                     break
 
-        fixed_rows.append({"base_mm": base, "values": values})
+        fixed_rows.append({"pos": base, "values": values})
 
     return fixed_rows, fixes
 
@@ -95,7 +97,7 @@ def fix_scale_errors(vols: dict) -> tuple[dict[int, float], list[str]]:
             v_down = round(v / 1000, 3)
             if v_down <= v_next and v_down >= v_next / 2:
                 corrected[mm] = v_down
-                fixes.append(f"mm={mm}: {v} -> {v_down} (div1000)")
+                fixes.append(f"pos={mm}: {v} -> {v_down} (div1000)")
 
     for i in range(1, len(mm_sorted)):
         mm = mm_sorted[i]
@@ -106,7 +108,7 @@ def fix_scale_errors(vols: dict) -> tuple[dict[int, float], list[str]]:
             v_up = v * 1000
             if v_up >= v_prev and v_up <= v_prev * 2:
                 corrected[mm] = v_up
-                fixes.append(f"mm={mm}: {v} -> {v_up} (x1000)")
+                fixes.append(f"pos={mm}: {v} -> {v_up} (x1000)")
 
     return corrected, fixes
 
@@ -163,7 +165,7 @@ def fix_scale_shift_runs(vols: dict, window: int = 20,
                 good_increments = close_window(good_increments + [candidate - corrected[mm_prev]])
                 continue
             fixes.append(
-                f"mm={run_start}-{mm_prev}: corregido {'/1000' if factor == 1000 else 'x1000'} "
+                f"pos={run_start}-{mm_prev}: corregido {'/1000' if factor == 1000 else 'x1000'} "
                 f"({mm_prev - run_start + 1} valor(es), corrimiento de escala sostenido)"
             )
             factor = None
@@ -199,7 +201,7 @@ def fix_scale_shift_runs(vols: dict, window: int = 20,
 
     if factor is not None:
         fixes.append(
-            f"mm={run_start}-{mm_sorted[-1]}: corregido {'/1000' if factor == 1000 else 'x1000'} "
+            f"pos={run_start}-{mm_sorted[-1]}: corregido {'/1000' if factor == 1000 else 'x1000'} "
             f"({mm_sorted[-1] - run_start + 1} valor(es), corrimiento de escala sostenido "
             f"hasta el final de los datos)"
         )
@@ -210,7 +212,7 @@ def fix_scale_shift_runs(vols: dict, window: int = 20,
 # ── Validacion ────────────────────────────────────────────────────────────────
 
 
-def validate_vols(vols: dict) -> dict:
+def validate_vols(vols: dict, unit_label: str = "mm") -> dict:
     errors, warnings = [], []
     if not vols:
         return {"ok": False, "errors": ["No hay datos."], "warnings": [],
@@ -231,7 +233,7 @@ def validate_vols(vols: dict) -> dict:
         ranges_str = ", ".join(str(a) if a == b else f"{a}-{b}" for a, b in groups[:10])
         if len(groups) > 10:
             ranges_str += f" ... y {len(groups)-10} rangos mas"
-        errors.append(f"MM faltantes ({len(missing)} valores): {ranges_str}")
+        errors.append(f"{unit_label.upper()} faltantes ({len(missing)} valores): {ranges_str}")
 
     non_mono = []
     prev_vol = None
@@ -241,7 +243,7 @@ def validate_vols(vols: dict) -> dict:
             non_mono.append((mm, prev_vol, vol))
         prev_vol = vol
     if non_mono:
-        detail = "; ".join(f"mm={mm}: {pv:.3f}->{v:.3f}" for mm, pv, v in non_mono[:5])
+        detail = "; ".join(f"{unit_label}={mm}: {pv:.3f}->{v:.3f}" for mm, pv, v in non_mono[:5])
         if len(non_mono) > 5: detail += f" ... y {len(non_mono)-5} mas"
         errors.append(f"Volumen decrece en {len(non_mono)} punto(s): {detail}")
 
@@ -267,7 +269,7 @@ def validate_vols(vols: dict) -> dict:
             if ratio > THRESHOLD or ratio < 1 / THRESHOLD:
                 outliers.append((mm, actual, local_med, ratio))
         if outliers:
-            detail = "; ".join(f"mm={mm}: D={act:.3f} (esp~{exp:.3f}, ratio={rat:.1f}x)"
+            detail = "; ".join(f"{unit_label}={mm}: D={act:.3f} (esp~{exp:.3f}, ratio={rat:.1f}x)"
                                for mm, act, exp, rat in outliers[:8])
             if len(outliers) > 8: detail += f" ... y {len(outliers)-8} mas"
             errors.append(f"Incremento anomalo en {len(outliers)} punto(s): {detail}")
@@ -278,7 +280,7 @@ def validate_vols(vols: dict) -> dict:
 
     stats = {
         "total_mm": len(vols),
-        "rango": f"{min_mm} - {max_mm} mm",
+        "rango": f"{min_mm} - {max_mm} {unit_label}",
         "vol_min": f"{min(vols.values()):.3f}",
         "vol_max": f"{max(vols.values()):.3f}",
         "faltantes": len(missing),
@@ -291,6 +293,9 @@ def validate_vols(vols: dict) -> dict:
 
 
 def find_pages_to_retry(page_results: list, validation: dict) -> set[int]:
+    """No asume una cantidad fija de valores por fila: usa len(row["values"])
+    para saber cuantas posiciones cubre cada fila, asi sirve tanto para
+    formatos de 10 valores por fila (INTI) como de 1 (Winter Service)."""
     bad_mm = validation["bad_mm"]
     missing_s = set(validation["missing"])
     retry = set()
@@ -299,16 +304,18 @@ def find_pages_to_retry(page_results: list, validation: dict) -> set[int]:
         if not rows:
             retry.add(page_num); continue
         for row in rows:
-            base = int(row["base_mm"])
-            if any((base + i) in bad_mm for i in range(10)):
+            base = int(row["pos"])
+            if any((base + i) in bad_mm for i in range(len(row["values"]))):
                 retry.add(page_num); break
 
     if missing_s:
         min_m, max_m = min(missing_s), max(missing_s)
         for page_num, rows in page_results:
             if not rows: continue
-            bases = [int(r["base_mm"]) for r in rows]
-            if max(bases) + 9 >= min_m - 20 and min(bases) <= max_m + 20:
+            spans = [(int(r["pos"]), int(r["pos"]) + len(r["values"]) - 1) for r in rows]
+            page_min = min(s[0] for s in spans)
+            page_max = max(s[1] for s in spans)
+            if page_max >= min_m - 20 and page_min <= max_m + 20:
                 retry.add(page_num)
 
     return retry

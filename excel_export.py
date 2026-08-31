@@ -21,7 +21,8 @@ def sanitize_filename_part(text: str) -> str:
 def generate_excel(vols: dict, tank_name: str, cert_number: str,
                     validation: dict, passes_info: str = "",
                     scale_fixes: Optional[list[str]] = None,
-                    log_lines: Optional[list[str]] = None) -> bytes:
+                    log_lines: Optional[list[str]] = None,
+                    height_unit: str = "mm", volume_unit: str = "dm3") -> bytes:
     wb = Workbook()
     ws = wb.active
     ws.title = f"TK-{tank_name}"[:31]
@@ -45,8 +46,8 @@ def generate_excel(vols: dict, tank_name: str, cert_number: str,
     info = [
         ("Razon Social:", "Antivari S.A."),
         ("Tanque N:", tank_name),
-        ("Certificado INTI N:", cert_number),
-        ("Unidad:", "dm3"),
+        ("Certificado N:", cert_number),
+        ("Unidad:", volume_unit),
         ("Validacion:", estado),
     ]
     for i, (lbl, val) in enumerate(info):
@@ -58,7 +59,7 @@ def generate_excel(vols: dict, tank_name: str, cert_number: str,
         ws.row_dimensions[r].height = 14
 
     header_row = len(info) + 2
-    for c, h in [(1, "mm"), (2, "dm3")]:
+    for c, h in [(1, height_unit), (2, volume_unit)]:
         cell = ws.cell(header_row, c, h)
         cell.font = Font(name="Arial", bold=True, color="FFFFFF", size=11)
         cell.fill = HEADER_FILL; cell.alignment = center; cell.border = border
@@ -113,11 +114,11 @@ def generate_excel(vols: dict, tank_name: str, cert_number: str,
     vrow(r, "Fecha", datetime.now().strftime("%Y-%m-%d %H:%M")); r += 1
     vrow(r, "Certificado", cert_number); r += 1
     vrow(r, "Procesamiento", passes_info); r += 1
-    vrow(r, "Total mm", str(validation["stats"].get("total_mm", "-"))); r += 1
+    vrow(r, f"Total {height_unit}", str(validation["stats"].get("total_mm", "-"))); r += 1
     vrow(r, "Rango", validation["stats"].get("rango", "-")); r += 1
-    vrow(r, "Volumen min", validation["stats"].get("vol_min", "-") + " dm3"); r += 1
-    vrow(r, "Volumen max", validation["stats"].get("vol_max", "-") + " dm3"); r += 1
-    vrow(r, "MM faltantes", str(validation["stats"].get("faltantes", "-"))); r += 1
+    vrow(r, "Volumen min", validation["stats"].get("vol_min", "-") + f" {volume_unit}"); r += 1
+    vrow(r, "Volumen max", validation["stats"].get("vol_max", "-") + f" {volume_unit}"); r += 1
+    vrow(r, f"{height_unit.upper()} faltantes", str(validation["stats"].get("faltantes", "-"))); r += 1
     r += 1
     result_txt = "APROBADA" if validation["ok"] else "FALLIDA - REVISAR FILAS EN ROJO"
     result_col = "008000" if validation["ok"] else "FF0000"

@@ -6,14 +6,13 @@ import streamlit as st
 
 from excel_export import generate_excel, sanitize_filename_part
 from extraction import (
-    BASE_PROMPT,
     MODEL_FAST,
     MODEL_PRECISE,
     ExtractJob,
     get_pdf_page_count,
-    make_retry_prompt,
     run_extractions,
 )
+from formats import FORMATS, make_retry_prompt
 from validation import (
     build_vols,
     find_pages_to_retry,
@@ -166,10 +165,10 @@ def get_api_key() -> str:
 
 
 def main():
-    st.set_page_config(page_title="Conversor Tablas INTI - Antivari",
+    st.set_page_config(page_title="Conversor Tablas de Calibracion - Antivari",
                         page_icon="🛰️", layout="centered")
     st.markdown(FUTURISTIC_CSS, unsafe_allow_html=True)
-    st.title("Conversor Tablas de Calibración INTI")
+    st.title("Conversor Tablas de Calibración")
     st.caption("Antivari S.A.")
     st.divider()
 
@@ -178,11 +177,16 @@ def main():
         "API Key de Anthropic", type="password",
         help="Configurala como secret (Streamlit) o variable de entorno ANTHROPIC_API_KEY (Render).")
 
+    format_key = st.selectbox(
+        "Formato de tabla", options=list(FORMATS.keys()),
+        format_func=lambda k: FORMATS[k].label)
+    fmt = FORMATS[format_key]
+
     col1, col2 = st.columns(2)
     with col1: tank_name = st.text_input("N de Tanque", placeholder="ej: TK-81")
-    with col2: cert_number = st.text_input("N Certificado INTI", placeholder="ej: INTI 2623")
+    with col2: cert_number = st.text_input("N Certificado", placeholder="ej: INTI 2623")
 
-    uploaded = st.file_uploader("Subi el PDF del certificado INTI", type="pdf")
+    uploaded = st.file_uploader("Subi el PDF del certificado", type="pdf")
     ready = bool(api_key and tank_name and uploaded)
 
     if st.button("Convertir a Excel", type="primary", disabled=not ready):
@@ -210,7 +214,7 @@ def main():
                     st.write(f"Pagina {page_num}: {len(rows)} filas extraidas.")
 
                 jobs: list[ExtractJob] = [
-                    (i, pdf_bytes, BASE_PROMPT, MODEL_FAST) for i in range(1, page_count + 1)
+                    (i, pdf_bytes, fmt.base_prompt, MODEL_FAST) for i in range(1, page_count + 1)
                 ]
                 results1 = run_extractions(client, jobs, on_done=on_page_done)
                 page_results = [(i, results1[i]) for i in range(1, page_count + 1)]
@@ -225,7 +229,7 @@ def main():
                 vols, sf1b = fix_scale_shift_runs(vols)
                 sf1 = row_fixes1 + sf1a + sf1b
                 if sf1a or sf1b: st.info(f"Escala corregida en {len(sf1a) + len(sf1b)} tramo(s)/valor(es).")
-                validation_1 = validate_vols(vols)
+                validation_1 = validate_vols(vols, unit_label=fmt.height_unit)
                 p1_lbl = "Pasada 1 completa - sin errores" if validation_1["ok"] else f"Pasada 1: {len(validation_1['errors'])} error(es)"
                 status1.update(label=p1_lbl, state="complete")
 
@@ -240,9 +244,9 @@ def main():
                     retry_jobs: list[ExtractJob] = []
                     for page_num in sorted(pages_to_retry):
                         _pn, old_rows = page_results[page_num - 1]
-                        bases = [int(r["base_mm"]) for r in old_rows] if old_rows else []
+                        bases = [int(r["pos"]) for r in old_rows] if old_rows else []
                         naive_start = min(bases) if bases else 0
-                        row_span = (max(bases) + 10 - min(bases)) if bases else 100
+                        row_span = len(old_rows) * fmt.values_per_row if old_rows else 100
 
                         # Ojo: no confiar en "bases" para el rango esperado, porque
                         # si la Pasada 1 le puso una etiqueta de fila equivocada a
@@ -253,13 +257,14 @@ def main():
                         ctx = get_prev_context(vols, naive_start)
                         prev_m, prev_v = ctx if ctx else (None, None)
                         if prev_m is not None:
-                            exp_start = ((prev_m + 1 + 9) // 10) * 10
+                            step = fmt.values_per_row
+                            exp_start = ((prev_m + 1 + step - 1) // step) * step
                         else:
                             exp_start = naive_start
                         exp_end = exp_start + row_span - 1 + 100  # margen generoso: la pagina
                         # puede tener mas filas de las que la Pasada 1 llego a detectar
 
-                        retry_prompt = make_retry_prompt(exp_start, exp_end, prev_m, prev_v)
+                        retry_prompt = make_retry_prompt(fmt, exp_start, exp_end, prev_m, prev_v)
                         retry_jobs.append((page_num, pdf_bytes, retry_prompt, MODEL_PRECISE))
 
                     def on_retry_done(page_num: int, new_rows: list[dict]) -> None:
@@ -283,7 +288,7 @@ def main():
                     vols, sf2b = fix_scale_shift_runs(vols)
                     sf2 = row_fixes2 + sf2a + sf2b
                     if sf2a or sf2b: st.info(f"Escala corregida en {len(sf2a) + len(sf2b)} tramo(s)/valor(es).")
-                    validation_2 = validate_vols(vols)
+                    validation_2 = validate_vols(vols, unit_label=fmt.height_unit)
                     p2_lbl = "Pasada 2 completa - sin errores" if validation_2["ok"] else f"Pasada 2: {len(validation_2['errors'])} error(es) restantes"
                     status2.update(label=p2_lbl, state="complete")
                 validation = validation_2
@@ -295,17 +300,19 @@ def main():
             st.write("Generando Excel...")
             excel_bytes = generate_excel(vols, tank_name, cert_number or "-",
                                           validation, passes_info, scale_fixes,
-                                          log_lines=log_handler.records)
+                                          log_lines=log_handler.records,
+                                          height_unit=fmt.height_unit,
+                                          volume_unit=fmt.volume_unit)
         finally:
             logger.removeHandler(log_handler)
 
         st.subheader("Reporte de validacion")
         s = validation["stats"]
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Total mm", s["total_mm"])
+        c1.metric(f"Total {fmt.height_unit}", s["total_mm"])
         c2.metric("Rango", s["rango"])
-        c3.metric("Vol. min", s["vol_min"] + " dm3")
-        c4.metric("Vol. max", s["vol_max"] + " dm3")
+        c3.metric("Vol. min", s["vol_min"] + f" {fmt.volume_unit}")
+        c4.metric("Vol. max", s["vol_max"] + f" {fmt.volume_unit}")
 
         if validation["ok"]:
             st.success("Validacion APROBADA - todos los controles pasaron.")

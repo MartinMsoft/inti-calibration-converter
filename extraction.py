@@ -10,6 +10,8 @@ from typing import Callable, Optional
 import anthropic
 from pdf2image import convert_from_bytes, pdfinfo_from_bytes
 
+from formats import INTI_PROMPT
+
 logger = logging.getLogger("inti_converter")
 
 MODEL_FAST = "claude-haiku-4-5-20251001"
@@ -45,63 +47,6 @@ def image_to_base64(image) -> str:
     return base64.standard_b64encode(buf.getvalue()).decode("utf-8")
 
 
-# ── Prompt ───────────────────────────────────────────────────────────────────
-
-BASE_PROMPT = """Esta imagen es una pagina de una tabla de calibracion de tanque industrial certificada por INTI (Argentina).
-
-La tabla tiene este formato:
-- Primera columna: valor base en mm (0, 10, 20, 30, ...)
-- Columnas 0 a 9: los 10 mm individuales de esa fila (base+0 a base+9)
-- Valores en dm3
-
-Extrae TODOS los datos en este JSON exacto:
-{
-  "rows": [
-    {"base_mm": 0, "values": [v0, v1, v2, v3, v4, v5, v6, v7, v8, v9]},
-    {"base_mm": 10, "values": [v0, v1, v2, v3, v4, v5, v6, v7, v8, v9]}
-  ]
-}
-
-Reglas CRITICAS:
-
-NUMEROS - el punto (.) es separador de MILES, NO decimal:
-  788.068   -> entero 788068
-  1.160.362 -> entero 1160362
-  Si hay DOS o mas puntos, siempre es entero: quita los puntos.
-  Si hay UN solo punto y el numero es menor a 10000, puede ser decimal: 27.344
-
-FORMATO:
-  Cada fila tiene EXACTAMENTE 10 valores (null si la celda esta vacia).
-  Si la pagina no tiene tabla (caratula, texto, firma), devuelve {"rows": []}.
-  IGNORAR numeros de pagina, encabezados, pies, firmas, sellos.
-  Responde UNICAMENTE con el JSON, sin texto adicional ni bloques de codigo."""
-
-
-def make_retry_prompt(expected_start: int, expected_end: int,
-                       prev_mm: Optional[int] = None, prev_vol: Optional[float] = None) -> str:
-    prompt = BASE_PROMPT + f"""
-
-ATENCION ESPECIAL - esta pagina se esta re-procesando porque la lectura anterior
-tuvo un error de validacion (faltan valores, o la secuencia no es consistente):
-Se espera que esta pagina cubra APROXIMADAMENTE mm {expected_start} a {expected_end},
-pero ese rango es una ESTIMACION basada en la pagina anterior, no una certeza.
-
-NO ASUMAS que la lectura anterior conto bien las filas ni les puso la etiqueta
-"mm" correcta en la primera columna. Volve a contar CADA fila de la imagen desde
-cero, columna por columna, y anota el numero exacto que esta impreso en la
-columna "mm" de cada fila (no lo deduzcas por continuidad). Es comun que una
-pagina tenga MAS filas de las detectadas antes, o que la primera columna se
-haya leido con un digito equivocado. Revisa cada digito con maxima precision:
-es una calibracion industrial critica."""
-    if prev_mm is not None:
-        prompt += f"""
-
-El ultimo valor CONFIRMADO de la pagina anterior fue mm={prev_mm}, volumen={prev_vol:.0f} dm3.
-La primera fila de esta pagina deberia continuar inmediatamente despues de ese mm
-(en pasos de 10), y los volumenes deben ser mayores y en la misma escala."""
-    return prompt
-
-
 # ── Extraccion de una pagina (con reintento ante error transitorio) ──────────
 
 
@@ -134,7 +79,7 @@ def extract_page(client: anthropic.Anthropic, image, page_num: int,
     """Extrae una pagina ya renderizada. Reintenta con backoff ante errores
     transitorios (red, rate-limit, JSON malformado); tras agotar los
     intentos devuelve lista vacia y deja constancia en el log."""
-    prompt = prompt or BASE_PROMPT
+    prompt = prompt or INTI_PROMPT
     image_b64 = image_to_base64(image)
     last_err: Optional[Exception] = None
     for attempt in range(1, MAX_RETRIES + 1):
