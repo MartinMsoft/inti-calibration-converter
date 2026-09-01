@@ -49,6 +49,12 @@ FORMATO:
   Copia cada digito de la imagen tal cual esta impreso -- NUNCA generes una
   secuencia matematica o un patron por tu cuenta, aunque los valores
   cercanos parezcan seguir una progresion regular.
+
+SI ESTA PAGINA EMPIEZA EN mm=0 (es la PRIMERA pagina de la tabla): los
+valores de esas primeras filas son los MAS CHICOS de todo el documento.
+Si te salen numeros con muchas mas cifras que los de las filas siguientes
+de esta misma pagina, es señal casi segura de un error de lectura -- volve
+a mirar esos digitos con cuidado extra.
   Responde UNICAMENTE con el JSON, sin texto adicional ni bloques de codigo."""
 
 
@@ -95,6 +101,13 @@ FORMATO:
   Si la pagina no tiene tabla (caratula, texto, firma), devuelve {"rows": []}.
   IGNORAR encabezados (nombre de empresa, tanque, direccion), pie de pagina
   (FECHA, HOJA, "Punto de referencia"), firmas y sellos.
+
+SI ESTA PAGINA EMPIEZA EN cm=0 (es la PRIMERA pagina de la tabla): los
+valores de "lts." de esas primeras filas son los MAS CHICOS de todo el
+documento (tipicamente 2 o 3 cifras enteras, como 23.240). Si te salen
+numeros de 4 o mas cifras enteras ahi (como 1023.340), es señal casi segura
+de un error de lectura -- volve a mirar esos digitos con cuidado extra
+antes de responder.
   Responde UNICAMENTE con el JSON, sin texto adicional ni bloques de codigo."""
 
 
@@ -146,4 +159,14 @@ leer un valor con claridad, es preferible dejarlo como null a inventarlo."""
 El ultimo valor CONFIRMADO de la pagina anterior fue {u}={prev_pos}, volumen={prev_vol:.3f} {v}.
 La primera fila de esta pagina deberia continuar inmediatamente despues de ese {u},
 y los volumenes deben ser mayores y en la misma escala."""
+    else:
+        prompt += f"""
+
+Esta pagina no tiene una pagina anterior confirmada -- es la PRIMERA pagina
+de la tabla ({u}=0 en adelante). Por eso mismo, esta es la parte MAS
+propensa a errores: no hay ningun valor previo contra el cual compararse.
+Los volumenes de estas primeras filas deben ser los MAS CHICOS de TODO el
+documento. Si un valor te sale con muchas mas cifras enteras que el resto
+de las filas de esta pagina, es casi seguro un error de lectura, no un
+salto real -- revisalo digito por digito antes de darlo por bueno."""
     return prompt
