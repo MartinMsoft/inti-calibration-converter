@@ -11,6 +11,7 @@ from validation import (
     fix_row_scale_consistency,
     fix_scale_errors,
     fix_scale_shift_runs,
+    get_forward_anchor,
     get_prev_context,
     validate_vols,
 )
@@ -113,6 +114,24 @@ def test_get_prev_context_returns_closest_prior_mm():
 def test_get_prev_context_returns_none_when_nothing_before():
     vols = {10: 10.0}
     assert get_prev_context(vols, 5) is None
+
+
+def test_get_forward_anchor_finds_first_confirmed_point_after():
+    vols = {0: 900.0, 1: 950.0, 2: 20.0, 3: 21.0, 4: 22.0}
+    bad_mm = {0, 1}  # las primeras dos filas quedaron marcadas mal
+    assert get_forward_anchor(vols, bad_mm, after_pos=0) == (2, 20.0)
+
+
+def test_get_forward_anchor_skips_bad_points():
+    vols = {0: 900.0, 1: 20.0, 2: 21.0}
+    bad_mm = {0, 1}  # mm=1 tambien esta marcado (ej: salto de bajada al recuperarse)
+    assert get_forward_anchor(vols, bad_mm, after_pos=0) == (2, 21.0)
+
+
+def test_get_forward_anchor_returns_none_when_nothing_qualifies():
+    vols = {0: 900.0, 1: 950.0}
+    bad_mm = {1}
+    assert get_forward_anchor(vols, bad_mm, after_pos=0) is None
 
 
 def _build_tank_curve(start_mm, end_mm, start_val, step):

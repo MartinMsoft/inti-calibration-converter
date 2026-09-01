@@ -330,3 +330,18 @@ def get_prev_context(vols: dict, expected_start: int) -> Optional[tuple[int, flo
         return None
     mm = max(candidates)
     return mm, vols[mm]
+
+
+def get_forward_anchor(vols: dict, bad_mm: set, after_pos: int) -> Optional[tuple[int, float]]:
+    """Primer (mm, vol) CONFIABLE (no marcado como bad_mm) con posicion mayor
+    a after_pos. Sirve de ancla cuando no hay pagina anterior (ej: la
+    primera pagina del documento no tiene de donde sacar un get_prev_context),
+    pero SI hay datos mas adelante -- en esta misma pagina o en la
+    siguiente -- que la validacion ya considero correctos. Como los
+    volumenes son siempre crecientes, ese punto futuro confirmado acota
+    "para arriba" cuanto pueden valer las filas anteriores."""
+    candidates = sorted(mm for mm in vols if mm > after_pos and mm not in bad_mm)
+    if not candidates:
+        return None
+    mm = candidates[0]
+    return mm, vols[mm]

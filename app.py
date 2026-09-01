@@ -21,6 +21,7 @@ from validation import (
     fix_row_scale_consistency,
     fix_scale_errors,
     fix_scale_shift_runs,
+    get_forward_anchor,
     get_prev_context,
     validate_vols,
 )
@@ -266,7 +267,17 @@ def main():
                         exp_end = exp_start + row_span - 1 + 100  # margen generoso: la pagina
                         # puede tener mas filas de las que la Pasada 1 llego a detectar
 
-                        retry_prompt = make_retry_prompt(fmt, exp_start, exp_end, prev_m, prev_v)
+                        # Sin pagina anterior (ej: pagina 1), buscamos un ancla hacia
+                        # ADELANTE: un punto ya validado como bueno mas alla de esta
+                        # pagina (en ella misma o en la siguiente). Como el volumen
+                        # siempre crece, ese punto futuro confirmado acota "para
+                        # arriba" cuanto pueden valer las filas de esta pagina.
+                        next_m, next_v = None, None
+                        if prev_m is None:
+                            fwd = get_forward_anchor(vols, validation_1["bad_mm"], naive_start)
+                            next_m, next_v = fwd if fwd else (None, None)
+
+                        retry_prompt = make_retry_prompt(fmt, exp_start, exp_end, prev_m, prev_v, next_m, next_v)
                         retry_jobs.append((page_num, pdf_bytes, retry_prompt, MODEL_PRECISE, RETRY_DPI))
 
                     def on_retry_done(page_num: int, new_rows: list[dict]) -> None:

@@ -132,7 +132,8 @@ FORMATS: dict[str, TableFormat] = {
 
 
 def make_retry_prompt(fmt: TableFormat, expected_start: int, expected_end: int,
-                       prev_pos: Optional[int] = None, prev_vol: Optional[float] = None) -> str:
+                       prev_pos: Optional[int] = None, prev_vol: Optional[float] = None,
+                       next_pos: Optional[int] = None, next_vol: Optional[float] = None) -> str:
     u, v = fmt.height_unit, fmt.volume_unit
     prompt = fmt.base_prompt + f"""
 
@@ -159,6 +160,20 @@ leer un valor con claridad, es preferible dejarlo como null a inventarlo."""
 El ultimo valor CONFIRMADO de la pagina anterior fue {u}={prev_pos}, volumen={prev_vol:.3f} {v}.
 La primera fila de esta pagina deberia continuar inmediatamente despues de ese {u},
 y los volumenes deben ser mayores y en la misma escala."""
+    elif next_pos is not None:
+        prompt += f"""
+
+Esta pagina no tiene una pagina anterior confirmada (es probablemente la
+primera pagina de la tabla), pero SI sabemos con certeza un dato mas
+adelante: en {u}={next_pos} el volumen CONFIRMADO es {next_vol:.3f} {v}.
+
+Como el volumen SIEMPRE crece con el {u}, cada fila de ESTA pagina con
+{u} menor a {next_pos} tiene que dar un valor MENOR a {next_vol:.3f} {v} --
+no puede ser igual ni mayor. Si te sale un numero igual o mayor a
+{next_vol:.3f} para una fila con {u} menor a {next_pos}, es un ERROR
+seguro (no un salto real de la curva): volve a mirar esos digitos.
+Los volumenes deben crecer de forma pareja y gradual desde el primer
+valor de la pagina hasta llegar a {next_vol:.3f} en {u}={next_pos}."""
     else:
         prompt += f"""
 
