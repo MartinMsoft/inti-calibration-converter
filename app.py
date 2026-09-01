@@ -6,8 +6,10 @@ import streamlit as st
 
 from excel_export import generate_excel, sanitize_filename_part
 from extraction import (
+    DEFAULT_DPI,
     MODEL_FAST,
     MODEL_PRECISE,
+    RETRY_DPI,
     ExtractJob,
     get_pdf_page_count,
     run_extractions,
@@ -214,7 +216,7 @@ def main():
                     st.write(f"Pagina {page_num}: {len(rows)} filas extraidas.")
 
                 jobs: list[ExtractJob] = [
-                    (i, pdf_bytes, fmt.base_prompt, MODEL_FAST) for i in range(1, page_count + 1)
+                    (i, pdf_bytes, fmt.base_prompt, MODEL_FAST, DEFAULT_DPI) for i in range(1, page_count + 1)
                 ]
                 results1 = run_extractions(client, jobs, on_done=on_page_done)
                 page_results = [(i, results1[i]) for i in range(1, page_count + 1)]
@@ -265,7 +267,7 @@ def main():
                         # puede tener mas filas de las que la Pasada 1 llego a detectar
 
                         retry_prompt = make_retry_prompt(fmt, exp_start, exp_end, prev_m, prev_v)
-                        retry_jobs.append((page_num, pdf_bytes, retry_prompt, MODEL_PRECISE))
+                        retry_jobs.append((page_num, pdf_bytes, retry_prompt, MODEL_PRECISE, RETRY_DPI))
 
                     def on_retry_done(page_num: int, new_rows: list[dict]) -> None:
                         old_rows = page_results[page_num - 1][1]

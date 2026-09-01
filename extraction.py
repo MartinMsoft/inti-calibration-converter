@@ -21,6 +21,7 @@ MAX_WORKERS = 5
 MAX_RETRIES = 3
 RETRY_BASE_DELAY = 1.5
 DEFAULT_DPI = 150
+RETRY_DPI = 300  # mas resolucion en los reintentos: pocas paginas, ya usan el modelo caro
 MAX_TOKENS = 8192
 
 # ── Helpers de PDF/imagen ─────────────────────────────────────────────────────
@@ -108,7 +109,7 @@ def extract_pdf_page(client: anthropic.Anthropic, pdf_bytes: bytes, page_num: in
 
 # ── Ejecucion concurrente ─────────────────────────────────────────────────────
 
-ExtractJob = tuple[int, bytes, str, str]  # (page_num, pdf_bytes, prompt, model)
+ExtractJob = tuple[int, bytes, str, str, int]  # (page_num, pdf_bytes, prompt, model, dpi)
 
 
 def run_extractions(client: anthropic.Anthropic, jobs: list[ExtractJob],
@@ -123,8 +124,8 @@ def run_extractions(client: anthropic.Anthropic, jobs: list[ExtractJob],
     results: dict[int, list[dict]] = {}
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         futures = {
-            pool.submit(extract_pdf_page, client, pdf_bytes, page_num, model, prompt): page_num
-            for page_num, pdf_bytes, prompt, model in jobs
+            pool.submit(extract_pdf_page, client, pdf_bytes, page_num, model, prompt, dpi): page_num
+            for page_num, pdf_bytes, prompt, model, dpi in jobs
         }
         for future in as_completed(futures):
             page_num = futures[future]
