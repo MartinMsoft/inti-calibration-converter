@@ -42,7 +42,12 @@ def generate_excel(vols: dict, tank_name: str, cert_number: str,
     ws["A1"].alignment = center
     ws.row_dimensions[1].height = 22
 
-    estado = "APROBADA" if validation["ok"] else "CON ERRORES - ver hoja VALIDACION"
+    if not validation["ok"]:
+        estado = "CON ERRORES - ver hoja VALIDACION"
+    elif validation.get("warnings"):
+        estado = "APROBADA CON ADVERTENCIAS - ver hoja VALIDACION"
+    else:
+        estado = "APROBADA"
     info = [
         ("Razon Social:", "Antivari S.A."),
         ("Tanque N:", tank_name),
@@ -54,8 +59,13 @@ def generate_excel(vols: dict, tank_name: str, cert_number: str,
         r = i + 2
         ws.cell(r, 1, lbl).font = Font(name="Arial", bold=True, size=9)
         c2 = ws.cell(r, 2, val)
-        c2.font = Font(name="Arial", size=9,
-                        color="FF0000" if "ERRORES" in str(val) else "000000")
+        if "CON ERRORES" in str(val):
+            color = "FF0000"
+        elif "ADVERTENCIAS" in str(val):
+            color = "CC6600"
+        else:
+            color = "000000"
+        c2.font = Font(name="Arial", size=9, color=color)
         ws.row_dimensions[r].height = 14
 
     header_row = len(info) + 2

@@ -212,6 +212,49 @@ def fix_scale_shift_runs(vols: dict, window: int = 20,
 # ── Validacion ────────────────────────────────────────────────────────────────
 
 
+def detect_uniform_runs(vols: dict, min_run: int = 8, tolerance: float = 0.0005) -> list[tuple[int, int]]:
+    """
+    Detecta tramos de incrementos SOSPECHOSAMENTE uniformes entre valores
+    consecutivos. Una tabla de calibracion real (redondeada a 3 decimales
+    desde una curva continua) casi siempre tiene una pequenia fluctuacion
+    natural en el incremento (ej 1.023, 1.024, 1.025) porque la tasa real
+    no suele ser un numero exacto. Si un tramo largo mantiene el incremento
+    IDENTICO paso a paso, es señal de que esos valores se generaron por
+    formula (el modelo "calculo" en vez de leer cada digito impreso).
+
+    No es una certeza -- un tramo genuinamente cilindrico del tanque puede
+    dar incrementos parejos por casualidad -- por eso se usa como
+    advertencia, no como error (no dispara reintentos ni bloquea el Excel).
+    """
+    mm_sorted = sorted(vols.keys())
+    runs: list[tuple[int, int]] = []
+    run_start: Optional[int] = None
+    run_end: Optional[int] = None
+    ref_inc: Optional[float] = None
+    count = 0
+
+    def flush():
+        if count >= min_run and run_start is not None:
+            runs.append((run_start, run_end))
+
+    for i in range(1, len(mm_sorted)):
+        mm, mm_prev = mm_sorted[i], mm_sorted[i - 1]
+        if mm != mm_prev + 1:
+            flush()
+            run_start, ref_inc, count = None, None, 0
+            continue
+        inc = vols[mm] - vols[mm_prev]
+        if ref_inc is not None and abs(inc - ref_inc) <= tolerance:
+            count += 1
+            run_end = mm
+        else:
+            flush()
+            run_start, run_end, count = mm_prev, mm, 1
+        ref_inc = inc
+    flush()
+    return runs
+
+
 def validate_vols(vols: dict, unit_label: str = "mm") -> dict:
     errors, warnings = [], []
     if not vols:
@@ -273,6 +316,15 @@ def validate_vols(vols: dict, unit_label: str = "mm") -> dict:
                                for mm, act, exp, rat in outliers[:8])
             if len(outliers) > 8: detail += f" ... y {len(outliers)-8} mas"
             errors.append(f"Incremento anomalo en {len(outliers)} punto(s): {detail}")
+
+    uniform_runs = detect_uniform_runs(vols)
+    if uniform_runs:
+        detail = "; ".join(f"{unit_label} {a}-{b}" for a, b in uniform_runs[:8])
+        if len(uniform_runs) > 8: detail += f" ... y {len(uniform_runs)-8} mas"
+        warnings.append(
+            f"Incrementos sospechosamente uniformes en {len(uniform_runs)} tramo(s) -- "
+            f"podria ser interpolacion en vez de lectura real, verificar contra el original: {detail}"
+        )
 
     bad_mm = set(missing)
     bad_mm.update(mm for mm, _, _ in non_mono)

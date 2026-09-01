@@ -7,6 +7,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from validation import (
     build_vols,
+    detect_uniform_runs,
     find_pages_to_retry,
     fix_row_scale_consistency,
     fix_scale_errors,
@@ -251,3 +252,41 @@ def test_find_pages_to_retry_missing_range_single_value_rows():
     ]
     retry = find_pages_to_retry(page_results, validation)
     assert 1 in retry
+
+
+# ── Deteccion de interpolacion (incrementos demasiado uniformes) ────────────
+
+
+def test_detect_uniform_runs_flags_perfectly_uniform_stretch():
+    # Caso real reportado: 10 valores seguidos con el incremento EXACTAMENTE
+    # igual (1.024), sin la fluctuacion natural de redondeo (1.023/1.024/1.025)
+    # que se ve en el PDF real -- señal de que se genero por formula.
+    vols = {i: round(320.100 + i * 1.024, 3) for i in range(10)}
+    runs = detect_uniform_runs(vols, min_run=8)
+    assert runs == [(0, 9)]
+
+
+def test_detect_uniform_runs_ignores_natural_fluctuation():
+    # Incrementos que alternan 1.023/1.024/1.025 (redondeo real de una tasa
+    # no exacta) no deberian marcarse como sospechosos.
+    increments = [1.024, 1.024, 1.023, 1.024, 1.025, 1.024, 1.024, 1.025, 1.024, 1.023]
+    vols = {}
+    val = 300.0
+    for i, inc in enumerate(increments):
+        vols[i] = round(val, 3)
+        val += inc
+    runs = detect_uniform_runs(vols, min_run=8)
+    assert runs == []
+
+
+def test_detect_uniform_runs_ignores_short_runs():
+    vols = {0: 0.0, 1: 1.024, 2: 2.048, 3: 5.0, 4: 5.5}
+    runs = detect_uniform_runs(vols, min_run=8)
+    assert runs == []
+
+
+def test_validate_vols_reports_uniform_runs_as_warning_not_error():
+    vols = {i: round(320.100 + i * 1.024, 3) for i in range(10)}
+    result = validate_vols(vols)
+    assert result["ok"]  # es advertencia, no error: no bloquea la validacion
+    assert any("uniform" in w for w in result["warnings"])

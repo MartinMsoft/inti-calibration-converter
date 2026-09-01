@@ -363,16 +363,18 @@ def main():
         c3.metric("Vol. min", s["vol_min"] + f" {fmt.volume_unit}")
         c4.metric("Vol. max", s["vol_max"] + f" {fmt.volume_unit}")
 
-        if validation["ok"]:
-            st.success("Validacion APROBADA - todos los controles pasaron.")
-        else:
+        if not validation["ok"]:
             st.error("Validacion FALLIDA - el Excel tiene errores (filas en rojo). Revisa antes de usar.")
+        elif validation["warnings"]:
+            st.warning("Validacion APROBADA CON ADVERTENCIAS - revisa los puntos senializados antes de usar.")
+        else:
+            st.success("Validacion APROBADA - todos los controles pasaron.")
 
         if validation["errors"]:
             with st.expander("Errores", expanded=True):
                 for e in validation["errors"]: st.error(e)
         if validation["warnings"]:
-            with st.expander("Advertencias"):
+            with st.expander("Advertencias", expanded=True):
                 for w in validation["warnings"]: st.warning(w)
 
         st.divider()
