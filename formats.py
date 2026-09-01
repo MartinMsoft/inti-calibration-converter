@@ -69,10 +69,13 @@ Extrae TODOS los datos, en orden (bloque 1 de arriba a abajo agrupando de a
 exacto:
 {
   "rows": [
-    {"pos": 0, "values": [23.240, 24.263, 25.286, 26.310, 27.333, 28.356, 29.380, 30.403, 31.426, 32.450]},
-    {"pos": 10, "values": [33.473, 34.496, 35.520, 36.543, 37.566, 38.590, 39.613, 40.636, 41.660, 42.683]}
+    {"pos": 0, "values": [412.050, 412.988, 413.926, 414.864, 415.802, 416.740, 417.678, 418.616, 419.554, 420.492]},
+    {"pos": 10, "values": [421.430, 422.368, 423.306, 424.244, 425.182, 426.120, 427.058, 427.996, 428.934, 429.872]}
   ]
 }
+(Los numeros de este ejemplo son inventados solo para mostrar el formato del
+JSON -- NO tienen relacion con la imagen real que vas a leer. Ignoralos por
+completo al extraer los datos reales.)
 
 Reglas CRITICAS:
 
