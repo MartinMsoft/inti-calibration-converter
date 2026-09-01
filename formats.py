@@ -46,6 +46,9 @@ FORMATO:
   Cada fila tiene EXACTAMENTE 10 valores (null si la celda esta vacia).
   Si la pagina no tiene tabla (caratula, texto, firma), devuelve {"rows": []}.
   IGNORAR numeros de pagina, encabezados, pies, firmas, sellos.
+  Copia cada digito de la imagen tal cual esta impreso -- NUNCA generes una
+  secuencia matematica o un patron por tu cuenta, aunque los valores
+  cercanos parezcan seguir una progresion regular.
   Responde UNICAMENTE con el JSON, sin texto adicional ni bloques de codigo."""
 
 
@@ -59,13 +62,15 @@ valores, el bloque 2 continua donde termino el bloque 1, y asi con el 3 y el 4.
 Por ejemplo, si el bloque 1 va de cm 0 a 49, el bloque 2 va de cm 50 a 99, el
 bloque 3 de 100 a 149, y el bloque 4 de 150 a 199.
 
-Extrae TODOS los datos, en orden (bloque 1 de arriba a abajo, despues bloque 2,
-despues bloque 3, despues bloque 4), en este JSON exacto -- una fila por cada
-linea impresa, con un solo valor cada una:
+Para reducir errores, agrupa los datos de a 10 filas consecutivas de la
+columna "cm." (aunque en la imagen sean 10 lineas impresas por separado).
+Extrae TODOS los datos, en orden (bloque 1 de arriba a abajo agrupando de a
+10, despues bloque 2, despues bloque 3, despues bloque 4), en este JSON
+exacto:
 {
   "rows": [
-    {"pos": 0, "values": [23.240]},
-    {"pos": 1, "values": [24.263]}
+    {"pos": 0, "values": [23.240, 24.263, 25.286, 26.310, 27.333, 28.356, 29.380, 30.403, 31.426, 32.450]},
+    {"pos": 10, "values": [33.473, 34.496, 35.520, 36.543, 37.566, 38.590, 39.613, 40.636, 41.660, 42.683]}
   ]
 }
 
@@ -76,8 +81,14 @@ miles). Los valores de "lts." tienen siempre 3 decimales, ej: 74.407 son
 setenta y cuatro litros con cuatrocientos siete mililitros, NO 74407.
 
 FORMATO:
-  "pos" es el numero entero de la columna "cm.".
-  Cada fila tiene EXACTAMENTE 1 valor en "values" (null si la celda esta vacia).
+  "pos" es el "cm." de la PRIMERA fila del grupo de 10.
+  Cada fila del JSON tiene EXACTAMENTE 10 valores en orden creciente de cm
+  (null si alguna celda esta vacia).
+  Copia cada digito de la imagen uno por uno, tal cual esta impreso --
+  NUNCA generes una secuencia matematica o un patron por tu cuenta (ej NO
+  hagas 102, 204, 306...), aunque los valores parezcan seguir una
+  progresion regular: cada numero debe salir de lo que ves impreso, no de
+  un calculo.
   Si la pagina no tiene tabla (caratula, texto, firma), devuelve {"rows": []}.
   IGNORAR encabezados (nombre de empresa, tanque, direccion), pie de pagina
   (FECHA, HOJA, "Punto de referencia"), firmas y sellos.
@@ -98,7 +109,7 @@ FORMATS: dict[str, TableFormat] = {
         label="Winter Service (cm, 4 columnas)",
         height_unit="cm",
         volume_unit="litros",
-        values_per_row=1,
+        values_per_row=10,
         base_prompt=WINTER_SERVICE_PROMPT,
     ),
 }
@@ -120,7 +131,12 @@ cero, columna por columna, y anota el numero exacto que esta impreso en la
 columna "{u}" de cada fila (no lo deduzcas por continuidad). Es comun que una
 pagina tenga MAS filas de las detectadas antes, o que la primera columna se
 haya leido con un digito equivocado. Revisa cada digito con maxima precision:
-es una calibracion industrial critica."""
+es una calibracion industrial critica.
+
+IMPORTANTE: copia cada numero de la imagen, digito por digito. NUNCA generes
+una secuencia matematica ni completes un patron por tu cuenta (ej: no
+inventes 102, 204, 306... solo porque "parece" una progresion): si no podes
+leer un valor con claridad, es preferible dejarlo como null a inventarlo."""
     if prev_pos is not None:
         prompt += f"""
 
