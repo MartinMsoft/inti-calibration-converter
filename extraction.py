@@ -51,6 +51,22 @@ def image_to_base64(image) -> str:
 # ── Extraccion de una pagina (con reintento ante error transitorio) ──────────
 
 
+def parse_json_response(raw: str) -> list[dict]:
+    """Extrae la lista "rows" de la respuesta del modelo. El prompt le pide
+    al modelo verificar los primeros valores en texto plano ANTES del JSON
+    (reduce lecturas apresuradas), asi que raw_decode ubica el JSON dentro
+    del texto e ignora tanto lo que venga antes como lo que quede despues,
+    en vez de asumir que el JSON es exactamente todo el contenido."""
+    raw = raw.strip()
+    raw = re.sub(r"^```[a-z]*\n?", "", raw)
+    raw = re.sub(r"\n?```$", "", raw)
+    idx = raw.find("{")
+    if idx == -1:
+        raise ValueError(f"No se encontro JSON en la respuesta: {raw[:200]!r}")
+    data, _end = json.JSONDecoder().raw_decode(raw, idx)
+    return data.get("rows", [])
+
+
 def _call_claude(client: anthropic.Anthropic, image_b64: str, model: str, prompt: str) -> list[dict]:
     response = client.messages.create(
         model=model,
@@ -64,15 +80,7 @@ def _call_claude(client: anthropic.Anthropic, image_b64: str, model: str, prompt
             ],
         }],
     )
-    raw = response.content[0].text.strip()
-    raw = re.sub(r"^```[a-z]*\n?", "", raw)
-    raw = re.sub(r"\n?```$", "", raw)
-    if not raw.startswith("{"):
-        idx = raw.find("{")
-        if idx != -1:
-            raw = raw[idx:]
-    data = json.loads(raw)
-    return data.get("rows", [])
+    return parse_json_response(response.content[0].text)
 
 
 def extract_page(client: anthropic.Anthropic, image, page_num: int,

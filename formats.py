@@ -55,7 +55,15 @@ valores de esas primeras filas son los MAS CHICOS de todo el documento.
 Si te salen numeros con muchas mas cifras que los de las filas siguientes
 de esta misma pagina, es señal casi segura de un error de lectura -- volve
 a mirar esos digitos con cuidado extra.
-  Responde UNICAMENTE con el JSON, sin texto adicional ni bloques de codigo."""
+
+ANTES de escribir el JSON: escribi en texto plano (una linea) los valores
+de la PRIMERA fila (mm=0 a mm=9) tal como los ves impresos en la imagen,
+uno por uno, separados por coma. Recien despues de esa verificacion escribi
+el JSON completo. El array "values" de esa primera fila en el JSON debe
+coincidir EXACTAMENTE con lo que escribiste en la verificacion -- si no
+coincide, releelos de nuevo antes de responder.
+  Despues de esa verificacion breve, el JSON debe ser lo ultimo que escribas
+  (nada de texto ni comentarios despues del JSON)."""
 
 
 WINTER_SERVICE_PROMPT = """Esta imagen es una pagina de una tabla de calibracion de tanque industrial
@@ -108,7 +116,16 @@ documento (tipicamente 2 o 3 cifras enteras, como 23.240). Si te salen
 numeros de 4 o mas cifras enteras ahi (como 1023.340), es señal casi segura
 de un error de lectura -- volve a mirar esos digitos con cuidado extra
 antes de responder.
-  Responde UNICAMENTE con el JSON, sin texto adicional ni bloques de codigo."""
+
+ANTES de escribir el JSON: escribi en texto plano (una linea) los valores
+de "lts." de la PRIMERA fila del bloque 1 (los primeros 10 "cm.") tal como
+los ves impresos en la imagen, uno por uno, separados por coma. Recien
+despues de esa verificacion escribi el JSON completo. El array "values" de
+esa primera fila en el JSON debe coincidir EXACTAMENTE con lo que
+escribiste en la verificacion -- si no coincide, releelos de nuevo antes
+de responder.
+  Despues de esa verificacion breve, el JSON debe ser lo ultimo que escribas
+  (nada de texto ni comentarios despues del JSON)."""
 
 
 FORMATS: dict[str, TableFormat] = {
