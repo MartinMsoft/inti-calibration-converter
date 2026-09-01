@@ -42,6 +42,20 @@ def render_pdf_page(pdf_bytes: bytes, page_num: int, dpi: int = DEFAULT_DPI):
     return pages[0]
 
 
+def render_pdf_page_cropped(pdf_bytes: bytes, page_num: int, dpi: int,
+                             crop_box: tuple[float, float, float, float]):
+    """Renderiza la pagina y la recorta a crop_box (left, top, right, bottom
+    como fracciones 0-1 del ancho/alto). Sirve para aislar un solo bloque de
+    columnas de una tabla multi-columna (ej: Winter Service) cuando el
+    modelo confunde la lectura con el layout completo de fondo -- una
+    imagen mas simple y sin el resto de la tabla al lado."""
+    image = render_pdf_page(pdf_bytes, page_num, dpi)
+    w, h = image.size
+    left, top, right, bottom = crop_box
+    box_px = (int(w * left), int(h * top), int(w * right), int(h * bottom))
+    return image.crop(box_px)
+
+
 def image_to_base64(image) -> str:
     buf = io.BytesIO()
     image.save(buf, format="PNG")

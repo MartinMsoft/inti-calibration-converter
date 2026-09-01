@@ -11,7 +11,9 @@ from extraction import (
     MODEL_PRECISE,
     RETRY_DPI,
     ExtractJob,
+    extract_page,
     get_pdf_page_count,
+    render_pdf_page_cropped,
     run_extractions,
 )
 from formats import FORMATS, make_retry_prompt
@@ -309,6 +311,40 @@ def main():
             else:
                 validation = validation_1
                 scale_fixes = sf1
+
+            # ── PASADA 3: recorte del primer bloque, solo para la pagina 1 ───
+            # (la unica sin pagina anterior de la cual anclarse) si despues de
+            # Sonnet los primeros valores siguen sin validar. Le mandamos una
+            # imagen mas simple -- una sola columna, sin el resto de la tabla
+            # ni el encabezado pesado al lado -- por si el problema es el
+            # layout completo, no la nitidez de los digitos.
+            still_bad = find_pages_to_retry(page_results, validation) if not validation["ok"] else set()
+            if 1 in still_bad and fmt.first_block_crop and fmt.crop_prompt:
+                with st.status("Pasada 3 - recorte enfocado en el primer bloque...",
+                                expanded=True) as status3:
+                    cropped_img = render_pdf_page_cropped(pdf_bytes, 1, RETRY_DPI, fmt.first_block_crop)
+                    new_rows = extract_page(client, cropped_img, 1, MODEL_PRECISE, fmt.crop_prompt)
+                    if new_rows:
+                        _pn, old_rows = page_results[0]
+                        merged = {r["pos"]: r for r in old_rows}
+                        for r in new_rows:
+                            merged[r["pos"]] = r
+                        page_results[0] = (1, [merged[k] for k in sorted(merged)])
+                        page_results, row_fixes3 = apply_row_consistency(page_results)
+                        scale_fixes = scale_fixes + row_fixes3
+
+                        vols = build_vols(page_results)
+                        vols, sf3a = fix_scale_errors(vols)
+                        vols, sf3b = fix_scale_shift_runs(vols)
+                        scale_fixes = scale_fixes + sf3a + sf3b
+                        validation = validate_vols(vols, unit_label=fmt.height_unit)
+                        passes_info += " + recorte pagina 1"
+                        p3_lbl = ("Pasada 3 completa - sin errores" if validation["ok"]
+                                  else f"Pasada 3: {len(validation['errors'])} error(es) restantes")
+                        status3.update(label=p3_lbl, state="complete")
+                    else:
+                        status3.update(label="Pasada 3: sin filas nuevas, se mantiene el resultado anterior",
+                                       state="complete")
 
             st.write("Generando Excel...")
             excel_bytes = generate_excel(vols, tank_name, cert_number or "-",

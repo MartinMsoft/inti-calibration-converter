@@ -17,6 +17,13 @@ class TableFormat:
     volume_unit: str      # "dm3", "litros", etc.
     values_per_row: int   # cuantos valores trae cada fila del JSON (10 en INTI, 1 en Winter Service)
     base_prompt: str
+    # Recorte opcional (left, top, right, bottom como fracciones 0-1) para
+    # aislar el primer bloque de una tabla multi-columna en un reintento
+    # extra cuando el resto de las estrategias fallan en las primeras filas
+    # (la pagina sin pagina anterior, sin ancla de continuidad). None si el
+    # formato no tiene layout multi-columna (ej: INTI).
+    first_block_crop: Optional[tuple[float, float, float, float]] = None
+    crop_prompt: Optional[str] = None
 
 
 INTI_PROMPT = """Esta imagen es una pagina de una tabla de calibracion de tanque industrial certificada por INTI (Argentina).
@@ -128,6 +135,31 @@ de responder.
   (nada de texto ni comentarios despues del JSON)."""
 
 
+WINTER_SERVICE_CROP_PROMPT = """Esta imagen es un RECORTE de una sola columna "cm." / "lts." de una tabla
+de calibracion de tanque industrial (recortamos las otras 3 columnas de al
+lado para que puedas concentrarte solo en esta).
+
+Extrae TODOS los valores que veas, en orden de arriba a abajo, agrupando de
+a 10 filas consecutivas, en este JSON exacto:
+{
+  "rows": [
+    {"pos": 0, "values": [412.050, 412.988, 413.926, 414.864, 415.802, 416.740, 417.678, 418.616, 419.554, 420.492]}
+  ]
+}
+(Los numeros de este ejemplo son inventados solo para mostrar el formato del
+JSON -- NO tienen relacion con la imagen real. Ignoralos al extraer.)
+
+Reglas CRITICAS:
+  El punto (.) es SIEMPRE separador DECIMAL. Los valores tienen 3 decimales.
+  "pos" es el "cm." de la primera fila del grupo.
+  Copia cada digito UNO POR UNO, exactamente como esta impreso. Estos son
+  los valores MAS CHICOS de todo el documento (2 o 3 cifras enteras, ej
+  23.240) -- NUNCA generes una secuencia matematica ni un patron por tu
+  cuenta (nada de progresiones tipo 102, 204, 306...): si un valor no se
+  ve con claridad, escribi null en vez de inventarlo.
+  Responde UNICAMENTE con el JSON, sin texto adicional."""
+
+
 FORMATS: dict[str, TableFormat] = {
     "inti": TableFormat(
         key="inti",
@@ -144,6 +176,8 @@ FORMATS: dict[str, TableFormat] = {
         volume_unit="litros",
         values_per_row=10,
         base_prompt=WINTER_SERVICE_PROMPT,
+        first_block_crop=(0.0, 0.170, 0.30, 0.965),
+        crop_prompt=WINTER_SERVICE_CROP_PROMPT,
     ),
 }
 
