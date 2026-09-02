@@ -156,3 +156,89 @@ def run_extractions(client: anthropic.Anthropic, jobs: list[ExtractJob],
             if on_done:
                 on_done(page_num, rows)
     return results
+
+
+# ── Modo fila-por-fila (una fila = una llamada, sin filas vecinas visibles) ──
+
+
+def parse_row_response(raw: str) -> tuple[Optional[int], Optional[float]]:
+    """Extrae (cm, lts) de la respuesta de una extraccion de fila individual."""
+    raw = raw.strip()
+    raw = re.sub(r"^```[a-z]*\n?", "", raw)
+    raw = re.sub(r"\n?```$", "", raw)
+    idx = raw.find("{")
+    if idx == -1:
+        raise ValueError(f"No se encontro JSON en la respuesta: {raw[:200]!r}")
+    data, _end = json.JSONDecoder().raw_decode(raw, idx)
+    return data.get("cm"), data.get("lts")
+
+
+def _call_claude_row(client: anthropic.Anthropic, image_b64: str, model: str,
+                      prompt: str) -> tuple[Optional[int], Optional[float]]:
+    response = client.messages.create(
+        model=model,
+        max_tokens=512,  # una sola fila, la respuesta es minuscula
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "image",
+                 "source": {"type": "base64", "media_type": "image/png", "data": image_b64}},
+                {"type": "text", "text": prompt},
+            ],
+        }],
+    )
+    return parse_row_response(response.content[0].text)
+
+
+def extract_row(client: anthropic.Anthropic, image, expected_pos: int,
+                 model: str, prompt: str) -> Optional[float]:
+    """Extrae el valor de UNA fila ya recortada. Reintenta ante error
+    transitorio; tambien reintenta si el "cm" que el modelo dice ver no
+    coincide con la posicion esperada (señal de que el recorte no aislo la
+    fila correcta -- mejor pedir de nuevo que aceptar un valor de otra fila)."""
+    image_b64 = image_to_base64(image)
+    last_err: Optional[Exception] = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            seen_pos, value = _call_claude_row(client, image_b64, model, prompt)
+            if value is None:
+                return None
+            if seen_pos is not None and int(seen_pos) != expected_pos:
+                logger.warning("Fila %d intento %d/%d: el modelo vio cm=%s en vez de %d, reintentando",
+                                expected_pos, attempt, MAX_RETRIES, seen_pos, expected_pos)
+                if attempt < MAX_RETRIES:
+                    time.sleep(RETRY_BASE_DELAY * (2 ** (attempt - 1)))
+                continue
+            return float(value)
+        except Exception as e:
+            last_err = e
+            logger.warning("Fila %d intento %d/%d fallo: %s", expected_pos, attempt, MAX_RETRIES, e)
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_BASE_DELAY * (2 ** (attempt - 1)))
+    if last_err:
+        logger.error("Fila %d: se omite tras %d intentos (%s)", expected_pos, MAX_RETRIES, last_err)
+    return None
+
+
+RowJob = tuple[int, object, int, str, str]  # (global_pos, cropped_image, expected_pos, prompt, model)
+
+
+def run_row_extractions(client: anthropic.Anthropic, jobs: list[RowJob],
+                         on_done: Optional[Callable[[int, Optional[float]], None]] = None
+                         ) -> dict[int, Optional[float]]:
+    """Version fila-por-fila de run_extractions: cada job ya trae su imagen
+    recortada (renderizada una sola vez por pagina y reutilizada para las
+    ~200 filas de esa pagina, no se vuelve a renderizar por fila)."""
+    results: dict[int, Optional[float]] = {}
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futures = {
+            pool.submit(extract_row, client, image, expected_pos, model, prompt): global_pos
+            for global_pos, image, expected_pos, prompt, model in jobs
+        }
+        for future in as_completed(futures):
+            global_pos = futures[future]
+            value = future.result()
+            results[global_pos] = value
+            if on_done:
+                on_done(global_pos, value)
+    return results

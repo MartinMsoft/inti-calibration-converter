@@ -11,12 +11,15 @@ from extraction import (
     MODEL_PRECISE,
     RETRY_DPI,
     ExtractJob,
+    RowJob,
     extract_page,
     get_pdf_page_count,
+    render_pdf_page,
     render_pdf_page_cropped,
     run_extractions,
+    run_row_extractions,
 )
-from formats import FORMATS, make_retry_prompt
+from formats import FORMATS, compute_row_crop_box, make_retry_prompt, make_row_prompt
 from validation import (
     build_vols,
     find_pages_to_retry,
@@ -159,6 +162,259 @@ def apply_row_consistency(page_results: list) -> tuple[list, list[str]]:
     return fixed, fixes
 
 
+def run_page_based_pipeline(client, pdf_bytes, fmt, log_handler):
+    """Extraccion por pagina completa (o por bloques de 10 filas): rapida y
+    barata, pero un modelo de lenguaje procesando muchas filas similares
+    seguidas puede "completar el patron" en vez de leer cada digito -- ver
+    run_row_by_row_pipeline para el modo de maxima fidelidad."""
+    pdf_bytes = pdf_bytes  # (solo por claridad de firma)
+
+    # ── PASADA 1: Haiku, todas las paginas en paralelo ────────────────
+    with st.status("Pasada 1 - lectura rapida (Haiku)...", expanded=True) as status1:
+        page_count = get_pdf_page_count(pdf_bytes)
+        st.write(f"PDF tiene {page_count} pagina(s).")
+
+        progress = st.progress(0.0)
+        done_count = 0
+
+        def on_page_done(page_num: int, rows: list[dict]) -> None:
+            nonlocal done_count
+            done_count += 1
+            progress.progress(done_count / page_count)
+            st.write(f"Pagina {page_num}: {len(rows)} filas extraidas.")
+
+        jobs: list[ExtractJob] = [
+            (i, pdf_bytes, fmt.base_prompt, MODEL_FAST, DEFAULT_DPI) for i in range(1, page_count + 1)
+        ]
+        results1 = run_extractions(client, jobs, on_done=on_page_done)
+        page_results = [(i, results1[i]) for i in range(1, page_count + 1)]
+        page_results, row_fixes1 = apply_row_consistency(page_results)
+        if row_fixes1: st.info(f"Consistencia interna de fila corregida en {len(row_fixes1)} valor(es).")
+
+        vols = build_vols(page_results)
+        if not vols:
+            st.error("No se extrajeron datos en la pasada 1. Revisa el PDF.")
+            st.stop()
+        vols, sf1a = fix_scale_errors(vols)
+        vols, sf1b = fix_scale_shift_runs(vols)
+        sf1 = row_fixes1 + sf1a + sf1b
+        if sf1a or sf1b: st.info(f"Escala corregida en {len(sf1a) + len(sf1b)} tramo(s)/valor(es).")
+        validation_1 = validate_vols(vols, unit_label=fmt.height_unit)
+        p1_lbl = "Pasada 1 completa - sin errores" if validation_1["ok"] else f"Pasada 1: {len(validation_1['errors'])} error(es)"
+        status1.update(label=p1_lbl, state="complete")
+
+    # ── PASADA 2: Sonnet, en paralelo, solo paginas con problemas ────
+    pages_to_retry = find_pages_to_retry(page_results, validation_1)
+    passes_info = "1 pasada (Haiku)"
+
+    if pages_to_retry and not validation_1["ok"]:
+        passes_info = f"2 pasadas - Haiku + Sonnet en {len(pages_to_retry)} pagina(s)"
+        with st.status(f"Pasada 2 - re-procesando {len(pages_to_retry)} pagina(s) con Sonnet...",
+                        expanded=True) as status2:
+            retry_jobs: list[ExtractJob] = []
+            for page_num in sorted(pages_to_retry):
+                _pn, old_rows = page_results[page_num - 1]
+                bases = [int(r["pos"]) for r in old_rows] if old_rows else []
+                naive_start = min(bases) if bases else 0
+                row_span = len(old_rows) * fmt.values_per_row if old_rows else 100
+
+                # Ojo: no confiar en "bases" para el rango esperado, porque
+                # si la Pasada 1 le puso una etiqueta de fila equivocada a
+                # TODA la pagina (lo vimos pasar: +100 de corrimiento), usar
+                # esas bases como "rango esperado" solo refuerza el mismo
+                # error en el reintento. Mejor anclar el inicio en la
+                # continuidad real (donde termino la pagina anterior).
+                ctx = get_prev_context(vols, naive_start)
+                prev_m, prev_v = ctx if ctx else (None, None)
+                if prev_m is not None:
+                    step = fmt.values_per_row
+                    exp_start = ((prev_m + 1 + step - 1) // step) * step
+                else:
+                    exp_start = naive_start
+                exp_end = exp_start + row_span - 1 + 100  # margen generoso: la pagina
+                # puede tener mas filas de las que la Pasada 1 llego a detectar
+
+                # Sin pagina anterior (ej: pagina 1), buscamos un ancla hacia
+                # ADELANTE: un punto ya validado como bueno mas alla de esta
+                # pagina (en ella misma o en la siguiente). Como el volumen
+                # siempre crece, ese punto futuro confirmado acota "para
+                # arriba" cuanto pueden valer las filas de esta pagina.
+                next_m, next_v = None, None
+                if prev_m is None:
+                    fwd = get_forward_anchor(vols, validation_1["bad_mm"], naive_start)
+                    next_m, next_v = fwd if fwd else (None, None)
+
+                retry_prompt = make_retry_prompt(fmt, exp_start, exp_end, prev_m, prev_v, next_m, next_v)
+                retry_jobs.append((page_num, pdf_bytes, retry_prompt, MODEL_PRECISE, RETRY_DPI))
+
+            def on_retry_done(page_num: int, new_rows: list[dict]) -> None:
+                old_rows = page_results[page_num - 1][1]
+                st.write(f"Pagina {page_num}: {len(new_rows)} filas Sonnet (Haiku tenia: {len(old_rows)}).")
+
+            results2 = run_extractions(client, retry_jobs, on_done=on_retry_done)
+            for page_num, new_rows in results2.items():
+                _pn, old_rows = page_results[page_num - 1]
+                keep_rows = new_rows if new_rows else old_rows
+                page_results[page_num - 1] = (page_num, keep_rows)
+
+            page_results, row_fixes2 = apply_row_consistency(page_results)
+            if row_fixes2: st.info(f"Consistencia interna de fila corregida en {len(row_fixes2)} valor(es).")
+
+            vols = build_vols(page_results)
+            if not vols:
+                st.error("No se pudieron extraer datos. Revisa el PDF.")
+                st.stop()
+            vols, sf2a = fix_scale_errors(vols)
+            vols, sf2b = fix_scale_shift_runs(vols)
+            sf2 = row_fixes2 + sf2a + sf2b
+            if sf2a or sf2b: st.info(f"Escala corregida en {len(sf2a) + len(sf2b)} tramo(s)/valor(es).")
+            validation_2 = validate_vols(vols, unit_label=fmt.height_unit)
+            p2_lbl = "Pasada 2 completa - sin errores" if validation_2["ok"] else f"Pasada 2: {len(validation_2['errors'])} error(es) restantes"
+            status2.update(label=p2_lbl, state="complete")
+        validation = validation_2
+        scale_fixes = sf2
+    else:
+        validation = validation_1
+        scale_fixes = sf1
+
+    # ── PASADA 3: recorte del primer bloque, solo para la pagina 1 ───
+    # (la unica sin pagina anterior de la cual anclarse) si despues de
+    # Sonnet los primeros valores siguen sin validar. Le mandamos una
+    # imagen mas simple -- una sola columna, sin el resto de la tabla
+    # ni el encabezado pesado al lado -- por si el problema es el
+    # layout completo, no la nitidez de los digitos.
+    still_bad = find_pages_to_retry(page_results, validation) if not validation["ok"] else set()
+    if 1 in still_bad and fmt.first_block_crop and fmt.crop_prompt:
+        with st.status("Pasada 3 - recorte enfocado en el primer bloque...",
+                        expanded=True) as status3:
+            cropped_img = render_pdf_page_cropped(pdf_bytes, 1, RETRY_DPI, fmt.first_block_crop)
+            new_rows = extract_page(client, cropped_img, 1, MODEL_PRECISE, fmt.crop_prompt)
+            if new_rows:
+                _pn, old_rows = page_results[0]
+                merged = {r["pos"]: r for r in old_rows}
+                for r in new_rows:
+                    merged[r["pos"]] = r
+                page_results[0] = (1, [merged[k] for k in sorted(merged)])
+                page_results, row_fixes3 = apply_row_consistency(page_results)
+                scale_fixes = scale_fixes + row_fixes3
+
+                vols = build_vols(page_results)
+                vols, sf3a = fix_scale_errors(vols)
+                vols, sf3b = fix_scale_shift_runs(vols)
+                scale_fixes = scale_fixes + sf3a + sf3b
+                validation = validate_vols(vols, unit_label=fmt.height_unit)
+                passes_info += " + recorte pagina 1"
+                p3_lbl = ("Pasada 3 completa - sin errores" if validation["ok"]
+                          else f"Pasada 3: {len(validation['errors'])} error(es) restantes")
+                status3.update(label=p3_lbl, state="complete")
+            else:
+                status3.update(label="Pasada 3: sin filas nuevas, se mantiene el resultado anterior",
+                               state="complete")
+
+    return vols, validation, passes_info, scale_fixes
+
+
+def run_row_by_row_pipeline(client, pdf_bytes, fmt, log_handler):
+    """Extraccion de maxima fidelidad: cada fila se recorta y se manda a la
+    IA de a UNA, sin ninguna otra fila visible. Mas lenta y mas cara (una
+    llamada por posicion en vez de una por pagina/bloque de 10), pero
+    elimina la posibilidad de que el modelo "complete un patron" viendo
+    varias filas similares juntas -- justamente la causa raiz que
+    identificamos en los modos anteriores."""
+    with st.status("Pasada 1 - lectura fila por fila (Haiku)...", expanded=True) as status1:
+        page_count = get_pdf_page_count(pdf_bytes)
+        total_positions = page_count * fmt.positions_per_page
+        st.write(f"PDF tiene {page_count} pagina(s), hasta {total_positions} filas a leer una por una.")
+
+        progress = st.progress(0.0)
+        done_count = 0
+
+        def on_row_done(global_pos: int, value) -> None:
+            nonlocal done_count
+            done_count += 1
+            if done_count % 25 == 0 or done_count == total_positions:
+                progress.progress(done_count / total_positions)
+                st.write(f"{done_count}/{total_positions} filas procesadas...")
+
+        # Procesamos PAGINA POR PAGINA (no todas de una): cada pagina se
+        # renderiza entera una sola vez, se recortan sus ~200 filas (los
+        # recortes son chicos, pero renderizar las 30 paginas de golpe y
+        # guardar sus imagenes completas mientras se arman todos los
+        # recortes seria el mismo problema de memoria que ya resolvimos
+        # antes (502 por falta de RAM en paginas grandes).
+        vols: dict[int, float] = {}
+        for page_num in range(1, page_count + 1):
+            page_image = render_pdf_page(pdf_bytes, page_num, RETRY_DPI)
+            page_jobs: list[RowJob] = []
+            for local_pos in range(fmt.positions_per_page):
+                global_pos = (page_num - 1) * fmt.positions_per_page + local_pos
+                box = compute_row_crop_box(fmt, local_pos)
+                w, h = page_image.size
+                box_px = (int(w * box[0]), int(h * box[1]), int(w * box[2]), int(h * box[3]))
+                cropped = page_image.crop(box_px)
+                page_jobs.append((global_pos, cropped, global_pos, make_row_prompt(global_pos), MODEL_FAST))
+            del page_image
+
+            page_results1 = run_row_extractions(client, page_jobs, on_done=on_row_done)
+            for pos, v in page_results1.items():
+                if v is not None:
+                    vols[pos] = v
+        if not vols:
+            st.error("No se extrajeron datos en la pasada 1. Revisa el PDF.")
+            st.stop()
+        vols, sf1 = fix_scale_errors(vols)
+        validation_1 = validate_vols(vols, unit_label=fmt.height_unit)
+        p1_lbl = "Pasada 1 completa - sin errores" if validation_1["ok"] else f"Pasada 1: {len(validation_1['errors'])} error(es)"
+        status1.update(label=p1_lbl, state="complete")
+
+    # ── PASADA 2: Sonnet, solo en las posiciones puntuales con problemas ──
+    bad_positions = validation_1["bad_mm"] | (set(range(min(vols), max(vols) + 1)) - set(vols.keys()))
+    passes_info = "1 pasada fila-por-fila (Haiku)"
+
+    if bad_positions and not validation_1["ok"]:
+        passes_info = f"2 pasadas fila-por-fila - Haiku + Sonnet en {len(bad_positions)} fila(s)"
+        with st.status(f"Pasada 2 - re-leyendo {len(bad_positions)} fila(s) puntuales con Sonnet...",
+                        expanded=True) as status2:
+            def on_retry_done(global_pos: int, value) -> None:
+                st.write(f"Fila {global_pos}: {'sin valor' if value is None else value}")
+
+            # Agrupamos por pagina (misma razon que en la Pasada 1: no
+            # queremos varias paginas completas en memoria a la vez).
+            by_page: dict[int, list[int]] = {}
+            for global_pos in sorted(bad_positions):
+                page_num = global_pos // fmt.positions_per_page + 1
+                by_page.setdefault(page_num, []).append(global_pos)
+
+            for page_num, positions in by_page.items():
+                page_image = render_pdf_page(pdf_bytes, page_num, RETRY_DPI)
+                retry_jobs: list[RowJob] = []
+                for global_pos in positions:
+                    local_pos = global_pos % fmt.positions_per_page
+                    box = compute_row_crop_box(fmt, local_pos)
+                    w, h = page_image.size
+                    box_px = (int(w * box[0]), int(h * box[1]), int(w * box[2]), int(h * box[3]))
+                    cropped = page_image.crop(box_px)
+                    retry_jobs.append((global_pos, cropped, global_pos, make_row_prompt(global_pos), MODEL_PRECISE))
+                del page_image
+
+                results2 = run_row_extractions(client, retry_jobs, on_done=on_retry_done)
+                for global_pos, value in results2.items():
+                    if value is not None:
+                        vols[global_pos] = value
+
+            vols, sf2 = fix_scale_errors(vols)
+            validation_2 = validate_vols(vols, unit_label=fmt.height_unit)
+            p2_lbl = "Pasada 2 completa - sin errores" if validation_2["ok"] else f"Pasada 2: {len(validation_2['errors'])} error(es) restantes"
+            status2.update(label=p2_lbl, state="complete")
+        validation = validation_2
+        scale_fixes = sf1 + sf2
+    else:
+        validation = validation_1
+        scale_fixes = sf1
+
+    return vols, validation, passes_info, scale_fixes
+
+
 def get_api_key() -> str:
     try:
         key = st.secrets["ANTHROPIC_API_KEY"]
@@ -204,147 +460,12 @@ def main():
         try:
             pdf_bytes = uploaded.read()
 
-            # ── PASADA 1: Haiku, todas las paginas en paralelo ────────────────
-            with st.status("Pasada 1 - lectura rapida (Haiku)...", expanded=True) as status1:
-                page_count = get_pdf_page_count(pdf_bytes)
-                st.write(f"PDF tiene {page_count} pagina(s).")
-
-                progress = st.progress(0.0)
-                done_count = 0
-
-                def on_page_done(page_num: int, rows: list[dict]) -> None:
-                    nonlocal done_count
-                    done_count += 1
-                    progress.progress(done_count / page_count)
-                    st.write(f"Pagina {page_num}: {len(rows)} filas extraidas.")
-
-                jobs: list[ExtractJob] = [
-                    (i, pdf_bytes, fmt.base_prompt, MODEL_FAST, DEFAULT_DPI) for i in range(1, page_count + 1)
-                ]
-                results1 = run_extractions(client, jobs, on_done=on_page_done)
-                page_results = [(i, results1[i]) for i in range(1, page_count + 1)]
-                page_results, row_fixes1 = apply_row_consistency(page_results)
-                if row_fixes1: st.info(f"Consistencia interna de fila corregida en {len(row_fixes1)} valor(es).")
-
-                vols = build_vols(page_results)
-                if not vols:
-                    st.error("No se extrajeron datos en la pasada 1. Revisa el PDF.")
-                    st.stop()
-                vols, sf1a = fix_scale_errors(vols)
-                vols, sf1b = fix_scale_shift_runs(vols)
-                sf1 = row_fixes1 + sf1a + sf1b
-                if sf1a or sf1b: st.info(f"Escala corregida en {len(sf1a) + len(sf1b)} tramo(s)/valor(es).")
-                validation_1 = validate_vols(vols, unit_label=fmt.height_unit)
-                p1_lbl = "Pasada 1 completa - sin errores" if validation_1["ok"] else f"Pasada 1: {len(validation_1['errors'])} error(es)"
-                status1.update(label=p1_lbl, state="complete")
-
-            # ── PASADA 2: Sonnet, en paralelo, solo paginas con problemas ────
-            pages_to_retry = find_pages_to_retry(page_results, validation_1)
-            passes_info = "1 pasada (Haiku)"
-
-            if pages_to_retry and not validation_1["ok"]:
-                passes_info = f"2 pasadas - Haiku + Sonnet en {len(pages_to_retry)} pagina(s)"
-                with st.status(f"Pasada 2 - re-procesando {len(pages_to_retry)} pagina(s) con Sonnet...",
-                                expanded=True) as status2:
-                    retry_jobs: list[ExtractJob] = []
-                    for page_num in sorted(pages_to_retry):
-                        _pn, old_rows = page_results[page_num - 1]
-                        bases = [int(r["pos"]) for r in old_rows] if old_rows else []
-                        naive_start = min(bases) if bases else 0
-                        row_span = len(old_rows) * fmt.values_per_row if old_rows else 100
-
-                        # Ojo: no confiar en "bases" para el rango esperado, porque
-                        # si la Pasada 1 le puso una etiqueta de fila equivocada a
-                        # TODA la pagina (lo vimos pasar: +100 de corrimiento), usar
-                        # esas bases como "rango esperado" solo refuerza el mismo
-                        # error en el reintento. Mejor anclar el inicio en la
-                        # continuidad real (donde termino la pagina anterior).
-                        ctx = get_prev_context(vols, naive_start)
-                        prev_m, prev_v = ctx if ctx else (None, None)
-                        if prev_m is not None:
-                            step = fmt.values_per_row
-                            exp_start = ((prev_m + 1 + step - 1) // step) * step
-                        else:
-                            exp_start = naive_start
-                        exp_end = exp_start + row_span - 1 + 100  # margen generoso: la pagina
-                        # puede tener mas filas de las que la Pasada 1 llego a detectar
-
-                        # Sin pagina anterior (ej: pagina 1), buscamos un ancla hacia
-                        # ADELANTE: un punto ya validado como bueno mas alla de esta
-                        # pagina (en ella misma o en la siguiente). Como el volumen
-                        # siempre crece, ese punto futuro confirmado acota "para
-                        # arriba" cuanto pueden valer las filas de esta pagina.
-                        next_m, next_v = None, None
-                        if prev_m is None:
-                            fwd = get_forward_anchor(vols, validation_1["bad_mm"], naive_start)
-                            next_m, next_v = fwd if fwd else (None, None)
-
-                        retry_prompt = make_retry_prompt(fmt, exp_start, exp_end, prev_m, prev_v, next_m, next_v)
-                        retry_jobs.append((page_num, pdf_bytes, retry_prompt, MODEL_PRECISE, RETRY_DPI))
-
-                    def on_retry_done(page_num: int, new_rows: list[dict]) -> None:
-                        old_rows = page_results[page_num - 1][1]
-                        st.write(f"Pagina {page_num}: {len(new_rows)} filas Sonnet (Haiku tenia: {len(old_rows)}).")
-
-                    results2 = run_extractions(client, retry_jobs, on_done=on_retry_done)
-                    for page_num, new_rows in results2.items():
-                        _pn, old_rows = page_results[page_num - 1]
-                        keep_rows = new_rows if new_rows else old_rows
-                        page_results[page_num - 1] = (page_num, keep_rows)
-
-                    page_results, row_fixes2 = apply_row_consistency(page_results)
-                    if row_fixes2: st.info(f"Consistencia interna de fila corregida en {len(row_fixes2)} valor(es).")
-
-                    vols = build_vols(page_results)
-                    if not vols:
-                        st.error("No se pudieron extraer datos. Revisa el PDF.")
-                        st.stop()
-                    vols, sf2a = fix_scale_errors(vols)
-                    vols, sf2b = fix_scale_shift_runs(vols)
-                    sf2 = row_fixes2 + sf2a + sf2b
-                    if sf2a or sf2b: st.info(f"Escala corregida en {len(sf2a) + len(sf2b)} tramo(s)/valor(es).")
-                    validation_2 = validate_vols(vols, unit_label=fmt.height_unit)
-                    p2_lbl = "Pasada 2 completa - sin errores" if validation_2["ok"] else f"Pasada 2: {len(validation_2['errors'])} error(es) restantes"
-                    status2.update(label=p2_lbl, state="complete")
-                validation = validation_2
-                scale_fixes = sf2
+            if fmt.row_by_row:
+                vols, validation, passes_info, scale_fixes = run_row_by_row_pipeline(
+                    client, pdf_bytes, fmt, log_handler)
             else:
-                validation = validation_1
-                scale_fixes = sf1
-
-            # ── PASADA 3: recorte del primer bloque, solo para la pagina 1 ───
-            # (la unica sin pagina anterior de la cual anclarse) si despues de
-            # Sonnet los primeros valores siguen sin validar. Le mandamos una
-            # imagen mas simple -- una sola columna, sin el resto de la tabla
-            # ni el encabezado pesado al lado -- por si el problema es el
-            # layout completo, no la nitidez de los digitos.
-            still_bad = find_pages_to_retry(page_results, validation) if not validation["ok"] else set()
-            if 1 in still_bad and fmt.first_block_crop and fmt.crop_prompt:
-                with st.status("Pasada 3 - recorte enfocado en el primer bloque...",
-                                expanded=True) as status3:
-                    cropped_img = render_pdf_page_cropped(pdf_bytes, 1, RETRY_DPI, fmt.first_block_crop)
-                    new_rows = extract_page(client, cropped_img, 1, MODEL_PRECISE, fmt.crop_prompt)
-                    if new_rows:
-                        _pn, old_rows = page_results[0]
-                        merged = {r["pos"]: r for r in old_rows}
-                        for r in new_rows:
-                            merged[r["pos"]] = r
-                        page_results[0] = (1, [merged[k] for k in sorted(merged)])
-                        page_results, row_fixes3 = apply_row_consistency(page_results)
-                        scale_fixes = scale_fixes + row_fixes3
-
-                        vols = build_vols(page_results)
-                        vols, sf3a = fix_scale_errors(vols)
-                        vols, sf3b = fix_scale_shift_runs(vols)
-                        scale_fixes = scale_fixes + sf3a + sf3b
-                        validation = validate_vols(vols, unit_label=fmt.height_unit)
-                        passes_info += " + recorte pagina 1"
-                        p3_lbl = ("Pasada 3 completa - sin errores" if validation["ok"]
-                                  else f"Pasada 3: {len(validation['errors'])} error(es) restantes")
-                        status3.update(label=p3_lbl, state="complete")
-                    else:
-                        status3.update(label="Pasada 3: sin filas nuevas, se mantiene el resultado anterior",
-                                       state="complete")
+                vols, validation, passes_info, scale_fixes = run_page_based_pipeline(
+                    client, pdf_bytes, fmt, log_handler)
 
             st.write("Generando Excel...")
             excel_bytes = generate_excel(vols, tank_name, cert_number or "-",

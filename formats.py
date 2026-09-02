@@ -25,6 +25,23 @@ class TableFormat:
     first_block_crop: Optional[tuple[float, float, float, float]] = None
     crop_prompt: Optional[str] = None
 
+    # ── Modo fila-por-fila (maxima fidelidad, mayor costo) ──────────────
+    # Si row_by_row=True, se ignora base_prompt/values_per_row y en cambio
+    # se recorta y lee CADA fila por separado -- sin ninguna otra fila
+    # visible, para que el modelo no tenga de donde "aprender" un patron y
+    # completarlo en vez de leer. Las coordenadas de recorte estan
+    # calibradas a mano sobre el layout real de T2.TK173.pdf; si otro
+    # documento del mismo formato tiene un layout apreciablemente distinto,
+    # estos numeros podrian necesitar recalibrarse.
+    row_by_row: bool = False
+    positions_per_page: Optional[int] = None       # posiciones totales por pagina (4 bloques x 50 = 200)
+    rows_per_block: Optional[int] = None            # filas por bloque (50)
+    block_x_ranges: Optional[tuple[tuple[float, float], ...]] = None  # (left, right) por bloque
+    row0_center_frac: Optional[float] = None        # centro de la fila 0, fraccion del alto de pagina
+    row_spacing_frac: Optional[float] = None        # separacion entre filas, fraccion del alto de pagina
+    row_half_height_frac: Optional[float] = None    # medio alto del recorte (varias filas de margen,
+                                                     # ver make_row_prompt para por que no es 1 sola fila)
+
 
 INTI_PROMPT = """Esta imagen es una pagina de una tabla de calibracion de tanque industrial certificada por INTI (Argentina).
 
@@ -160,6 +177,44 @@ Reglas CRITICAS:
   Responde UNICAMENTE con el JSON, sin texto adicional."""
 
 
+def make_row_prompt(target_pos: int) -> str:
+    """Prompt para el modo fila-por-fila. El recorte puede mostrar varias
+    filas vecinas (el recorte geometrico no es perfecto -- un escaneo de
+    1992 impreso con matriz de puntos tiene pequenias derivas mecanicas
+    entre columnas), asi que en vez de asumir "la unica fila visible es la
+    correcta", le pedimos al modelo que busque especificamente la fila con
+    el "cm" que ya sabemos que corresponde (dato nuestro, no una adivinanza
+    suya) -- mucho menos repetitivo que un bloque de 50 filas, pero
+    tolerante a que la fila objetivo no quede perfectamente centrada."""
+    return f"""Esta imagen es un recorte de una tabla de calibracion de tanque industrial:
+puede mostrar VARIAS filas vecinas de dos columnas, "cm." y "lts."
+
+Buscá especificamente la fila donde la columna "cm." dice {target_pos}, y
+decime el valor de "lts." impreso al lado de ESA fila exacta, con sus 3
+decimales, copiando cada digito tal cual esta impreso. No calcules, no
+asumas, no completes un patron a partir de las otras filas visibles -- leé
+literalmente el numero impreso en la fila cm={target_pos}.
+
+Respondé UNICAMENTE con este JSON, sin texto adicional:
+{{"cm": {target_pos}, "lts": <numero decimal con 3 cifras que ves impreso en esa fila>}}
+
+Si la fila cm={target_pos} NO aparece en este recorte, o no se lee con
+claridad, respondé {{"cm": {target_pos}, "lts": null}}."""
+
+
+def compute_row_crop_box(fmt: TableFormat, global_pos: int) -> tuple[float, float, float, float]:
+    """Calcula el recorte (left, top, right, bottom, como fracciones de la
+    pagina) para UNA fila especifica, dado el formato y la posicion global
+    (0-indexed) dentro de esa pagina."""
+    block_idx = global_pos // fmt.rows_per_block
+    row_in_block = global_pos % fmt.rows_per_block
+    left, right = fmt.block_x_ranges[block_idx]
+    center = fmt.row0_center_frac + row_in_block * fmt.row_spacing_frac
+    top = center - fmt.row_half_height_frac
+    bottom = center + fmt.row_half_height_frac
+    return (left, top, right, bottom)
+
+
 FORMATS: dict[str, TableFormat] = {
     "inti": TableFormat(
         key="inti",
@@ -178,6 +233,27 @@ FORMATS: dict[str, TableFormat] = {
         base_prompt=WINTER_SERVICE_PROMPT,
         first_block_crop=(0.0, 0.170, 0.30, 0.965),
         crop_prompt=WINTER_SERVICE_CROP_PROMPT,
+    ),
+    "winter_service_exact": TableFormat(
+        key="winter_service_exact",
+        label="Winter Service - fila por fila (maxima fidelidad, mas lento)",
+        height_unit="cm",
+        volume_unit="litros",
+        values_per_row=1,
+        base_prompt=WINTER_SERVICE_PROMPT,  # sin uso en modo row_by_row, solo por completitud
+        row_by_row=True,
+        positions_per_page=200,
+        rows_per_block=50,
+        block_x_ranges=((0.0, 0.25), (0.245, 0.50), (0.495, 0.75), (0.745, 1.0)),
+        row0_center_frac=0.2055,
+        row_spacing_frac=0.01460,
+        # Margen ancho (~3.5 filas para cada lado): un escaneo de 1992 con
+        # matriz de puntos tiene deriva vertical mecanica entre columnas --
+        # medimos hasta ~2 filas de corrimiento en el bloque mas a la
+        # derecha. Mejor mostrar unas pocas filas de mas (y pedirle al
+        # modelo la fila exacta por su "cm", ver make_row_prompt) que
+        # arriesgarse a que la fila buscada quede afuera del recorte.
+        row_half_height_frac=0.0511,
     ),
 }
 
