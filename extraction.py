@@ -193,22 +193,29 @@ def _call_claude_row(client: anthropic.Anthropic, image_b64: str, model: str,
 def extract_row(client: anthropic.Anthropic, image, expected_pos: int,
                  model: str, prompt: str) -> Optional[float]:
     """Extrae el valor de UNA fila ya recortada. Reintenta ante error
-    transitorio; tambien reintenta si el "cm" que el modelo dice ver no
-    coincide con la posicion esperada (señal de que el recorte no aislo la
-    fila correcta -- mejor pedir de nuevo que aceptar un valor de otra fila)."""
+    transitorio, si el "cm" que el modelo dice ver no coincide con la
+    posicion esperada (señal de que el recorte no aislo la fila correcta),
+    y tambien si el modelo responde null -- una sola respuesta "no lo veo
+    claro" no es necesariamente definitiva, vale la pena volver a preguntar
+    antes de darla por vacia."""
     image_b64 = image_to_base64(image)
     last_err: Optional[Exception] = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             seen_pos, value = _call_claude_row(client, image_b64, model, prompt)
-            if value is None:
-                return None
             if seen_pos is not None and int(seen_pos) != expected_pos:
                 logger.warning("Fila %d intento %d/%d: el modelo vio cm=%s en vez de %d, reintentando",
                                 expected_pos, attempt, MAX_RETRIES, seen_pos, expected_pos)
                 if attempt < MAX_RETRIES:
                     time.sleep(RETRY_BASE_DELAY * (2 ** (attempt - 1)))
                 continue
+            if value is None:
+                if attempt < MAX_RETRIES:
+                    logger.warning("Fila %d intento %d/%d: el modelo respondio null, reintentando",
+                                    expected_pos, attempt, MAX_RETRIES)
+                    time.sleep(RETRY_BASE_DELAY * (2 ** (attempt - 1)))
+                    continue
+                return None
             return float(value)
         except Exception as e:
             last_err = e
@@ -220,19 +227,48 @@ def extract_row(client: anthropic.Anthropic, image, expected_pos: int,
     return None
 
 
+def extract_row_consensus(client: anthropic.Anthropic, image, expected_pos: int,
+                           model: str, prompt: str, max_reads: int = 3,
+                           tolerance: float = 0.0005) -> Optional[float]:
+    """Version de maxima confianza de extract_row: en vez de confiar en una
+    sola lectura (que puede tener un digito mal transcripto aunque la
+    imagen sea perfectamente clara -- un modelo de vision puede fallar en
+    esto ocasionalmente), pide la MISMA fila varias veces de forma
+    independiente y solo acepta un valor cuando dos lecturas distintas
+    coinciden. Si nunca coinciden dos, se devuelve None -- es preferible
+    dejar la fila sin confirmar (y que se marque como faltante) a aceptar
+    un digito que no se pudo verificar dos veces."""
+    reads: list[float] = []
+    for _ in range(max_reads):
+        v = extract_row(client, image, expected_pos, model, prompt)
+        if v is None:
+            continue
+        for prior in reads:
+            if abs(prior - v) <= tolerance:
+                return v
+        reads.append(v)
+    return None
+
+
 RowJob = tuple[int, object, int, str, str]  # (global_pos, cropped_image, expected_pos, prompt, model)
 
 
 def run_row_extractions(client: anthropic.Anthropic, jobs: list[RowJob],
-                         on_done: Optional[Callable[[int, Optional[float]], None]] = None
+                         on_done: Optional[Callable[[int, Optional[float]], None]] = None,
+                         confirm: bool = False
                          ) -> dict[int, Optional[float]]:
     """Version fila-por-fila de run_extractions: cada job ya trae su imagen
     recortada (renderizada una sola vez por pagina y reutilizada para las
-    ~200 filas de esa pagina, no se vuelve a renderizar por fila)."""
+    ~200 filas de esa pagina, no se vuelve a renderizar por fila).
+    Con confirm=True usa extract_row_consensus (varias lecturas
+    independientes que deben coincidir) en vez de una sola lectura -- mas
+    lento y caro, pensado para la pasada de reintento sobre las pocas
+    posiciones puntuales que quedaron marcadas dudosas."""
+    extractor = extract_row_consensus if confirm else extract_row
     results: dict[int, Optional[float]] = {}
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         futures = {
-            pool.submit(extract_row, client, image, expected_pos, model, prompt): global_pos
+            pool.submit(extractor, client, image, expected_pos, model, prompt): global_pos
             for global_pos, image, expected_pos, prompt, model in jobs
         }
         for future in as_completed(futures):

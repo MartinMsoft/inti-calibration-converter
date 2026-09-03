@@ -384,8 +384,9 @@ def run_row_by_row_pipeline(client, pdf_bytes, fmt, log_handler):
     passes_info = "1 pasada fila-por-fila (Haiku)"
 
     if bad_positions and not validation_1["ok"]:
-        passes_info = f"2 pasadas fila-por-fila - Haiku + Sonnet en {len(bad_positions)} fila(s)"
-        with st.status(f"Pasada 2 - re-leyendo {len(bad_positions)} fila(s) puntuales con Sonnet...",
+        passes_info = f"2 pasadas fila-por-fila - Haiku + Sonnet con doble verificacion en {len(bad_positions)} fila(s)"
+        with st.status(f"Pasada 2 - re-leyendo {len(bad_positions)} fila(s) puntuales con Sonnet "
+                        f"(2 lecturas independientes por fila, solo se acepta si coinciden)...",
                         expanded=True) as status2:
             def on_retry_done(global_pos: int, value) -> None:
                 st.write(f"Fila {global_pos}: {'sin valor' if value is None else value}")
@@ -410,7 +411,7 @@ def run_row_by_row_pipeline(client, pdf_bytes, fmt, log_handler):
                         cropped = page_image.crop(box_px)
                         retry_jobs.append((global_pos, cropped, global_pos, make_row_prompt(global_pos), MODEL_PRECISE))
 
-                    results2 = run_row_extractions(client, retry_jobs, on_done=on_retry_done)
+                    results2 = run_row_extractions(client, retry_jobs, on_done=on_retry_done, confirm=True)
                     for global_pos, value in results2.items():
                         if value is not None:
                             vols[global_pos] = value
