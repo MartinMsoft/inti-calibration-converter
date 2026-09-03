@@ -330,7 +330,8 @@ def run_row_by_row_pipeline(client, pdf_bytes, fmt, log_handler):
     elimina la posibilidad de que el modelo "complete un patron" viendo
     varias filas similares juntas -- justamente la causa raiz que
     identificamos en los modos anteriores."""
-    with st.status("Pasada 1 - lectura fila por fila (Haiku)...", expanded=True) as status1:
+    with st.status("Pasada 1 - lectura fila por fila con doble verificacion (Haiku)...",
+                    expanded=True) as status1:
         page_count = get_pdf_page_count(pdf_bytes)
         total_positions = page_count * fmt.positions_per_page
         st.write(f"PDF tiene {page_count} pagina(s), hasta {total_positions} filas a leer una por una.")
@@ -366,7 +367,7 @@ def run_row_by_row_pipeline(client, pdf_bytes, fmt, log_handler):
                     cropped = page_image.crop(box_px)
                     page_jobs.append((global_pos, cropped, global_pos, make_row_prompt(global_pos), MODEL_FAST))
 
-                page_results1 = run_row_extractions(client, page_jobs, on_done=on_row_done)
+                page_results1 = run_row_extractions(client, page_jobs, on_done=on_row_done, confirm=True)
                 for pos, v in page_results1.items():
                     if v is not None:
                         vols[pos] = v
@@ -381,7 +382,7 @@ def run_row_by_row_pipeline(client, pdf_bytes, fmt, log_handler):
 
     # ── PASADA 2: Sonnet, solo en las posiciones puntuales con problemas ──
     bad_positions = validation_1["bad_mm"] | (set(range(min(vols), max(vols) + 1)) - set(vols.keys()))
-    passes_info = "1 pasada fila-por-fila (Haiku)"
+    passes_info = "1 pasada fila-por-fila con doble verificacion (Haiku)"
 
     if bad_positions and not validation_1["ok"]:
         passes_info = f"2 pasadas fila-por-fila - Haiku + Sonnet con doble verificacion en {len(bad_positions)} fila(s)"
