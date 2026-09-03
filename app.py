@@ -34,6 +34,15 @@ from validation import (
 logger = logging.getLogger("inti_converter")
 logger.setLevel(logging.INFO)
 
+# Cuantas filas se recortan y se mandan a la API por tanda dentro de una
+# misma pagina en el modo fila-por-fila. Armar las ~200 filas de la pagina
+# de una sola vez (y recien despues pasarlas al pool de hilos) mantiene
+# esas ~200 imagenes recortadas en memoria a la vez -- exactamente el mismo
+# problema de RAM que ya resolvimos para paginas enteras, pero reaparecido
+# a nivel de recortes. Procesando de a tandas chicas, como mucho hay
+# ROW_CHUNK_SIZE recortes vivos por vez.
+ROW_CHUNK_SIZE = 20
+
 FUTURISTIC_CSS = """
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@600;800&family=Rajdhani:wght@400;500;600;700&display=swap');
@@ -345,20 +354,23 @@ def run_row_by_row_pipeline(client, pdf_bytes, fmt, log_handler):
         vols: dict[int, float] = {}
         for page_num in range(1, page_count + 1):
             page_image = render_pdf_page(pdf_bytes, page_num, RETRY_DPI)
-            page_jobs: list[RowJob] = []
-            for local_pos in range(fmt.positions_per_page):
-                global_pos = (page_num - 1) * fmt.positions_per_page + local_pos
-                box = compute_row_crop_box(fmt, local_pos)
-                w, h = page_image.size
-                box_px = (int(w * box[0]), int(h * box[1]), int(w * box[2]), int(h * box[3]))
-                cropped = page_image.crop(box_px)
-                page_jobs.append((global_pos, cropped, global_pos, make_row_prompt(global_pos), MODEL_FAST))
-            del page_image
+            w, h = page_image.size
+            local_positions = list(range(fmt.positions_per_page))
+            for chunk_start in range(0, len(local_positions), ROW_CHUNK_SIZE):
+                chunk = local_positions[chunk_start:chunk_start + ROW_CHUNK_SIZE]
+                page_jobs: list[RowJob] = []
+                for local_pos in chunk:
+                    global_pos = (page_num - 1) * fmt.positions_per_page + local_pos
+                    box = compute_row_crop_box(fmt, local_pos)
+                    box_px = (int(w * box[0]), int(h * box[1]), int(w * box[2]), int(h * box[3]))
+                    cropped = page_image.crop(box_px)
+                    page_jobs.append((global_pos, cropped, global_pos, make_row_prompt(global_pos), MODEL_FAST))
 
-            page_results1 = run_row_extractions(client, page_jobs, on_done=on_row_done)
-            for pos, v in page_results1.items():
-                if v is not None:
-                    vols[pos] = v
+                page_results1 = run_row_extractions(client, page_jobs, on_done=on_row_done)
+                for pos, v in page_results1.items():
+                    if v is not None:
+                        vols[pos] = v
+            del page_image
         if not vols:
             st.error("No se extrajeron datos en la pasada 1. Revisa el PDF.")
             st.stop()
@@ -387,20 +399,22 @@ def run_row_by_row_pipeline(client, pdf_bytes, fmt, log_handler):
 
             for page_num, positions in by_page.items():
                 page_image = render_pdf_page(pdf_bytes, page_num, RETRY_DPI)
-                retry_jobs: list[RowJob] = []
-                for global_pos in positions:
-                    local_pos = global_pos % fmt.positions_per_page
-                    box = compute_row_crop_box(fmt, local_pos)
-                    w, h = page_image.size
-                    box_px = (int(w * box[0]), int(h * box[1]), int(w * box[2]), int(h * box[3]))
-                    cropped = page_image.crop(box_px)
-                    retry_jobs.append((global_pos, cropped, global_pos, make_row_prompt(global_pos), MODEL_PRECISE))
-                del page_image
+                w, h = page_image.size
+                for chunk_start in range(0, len(positions), ROW_CHUNK_SIZE):
+                    chunk = positions[chunk_start:chunk_start + ROW_CHUNK_SIZE]
+                    retry_jobs: list[RowJob] = []
+                    for global_pos in chunk:
+                        local_pos = global_pos % fmt.positions_per_page
+                        box = compute_row_crop_box(fmt, local_pos)
+                        box_px = (int(w * box[0]), int(h * box[1]), int(w * box[2]), int(h * box[3]))
+                        cropped = page_image.crop(box_px)
+                        retry_jobs.append((global_pos, cropped, global_pos, make_row_prompt(global_pos), MODEL_PRECISE))
 
-                results2 = run_row_extractions(client, retry_jobs, on_done=on_retry_done)
-                for global_pos, value in results2.items():
-                    if value is not None:
-                        vols[global_pos] = value
+                    results2 = run_row_extractions(client, retry_jobs, on_done=on_retry_done)
+                    for global_pos, value in results2.items():
+                        if value is not None:
+                            vols[global_pos] = value
+                del page_image
 
             vols, sf2 = fix_scale_errors(vols)
             validation_2 = validate_vols(vols, unit_label=fmt.height_unit)
